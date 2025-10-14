@@ -1,0 +1,92 @@
+/* ===== FullCalendar ===== */
+.fc-theme-standard .fc-scrollgrid {
+  border: none !important;
+}
+.fc-theme-standard td,
+.fc-theme-standard th {
+  border: none !important;
+  background: transparent !important;
+}
+
+.fc .fc-col-header-cell-cushion {
+  text-transform: uppercase !important;
+  font-weight: 600;
+  color: #3d0000;
+  font-size: 0.9rem;
+}
+
+.fc-toolbar-title {
+  font-size: 1.5rem;
+  font-weight: 700;
+  color: #3d0000;
+}
+.fc .fc-toolbar button {
+  background: none !important;
+  border: none !important;
+  box-shadow: none !important;
+  color: #f6a56f !important;
+  font-size: 1.5rem;
+  padding: 0 8px;
+}
+.fc .fc-toolbar button:hover {
+  background: none !important;
+  color: #d96f3d !important;
+}
+
+/* ===== General style for date numbers (placed before highlights) ===== */
+.fc-daygrid-day-number {
+  color: #000 !important;
+  font-weight: 500;
+  line-height: 0.9;
+  font-size: 18px;
+  /* To move it further toward bottom-left, adjust margin here (e.g., top 20px, left 12px) */
+  margin: 16px 30 -2 0;
+  padding: 0; /* Do not affect highlight area — highlight styles will override */
+  text-align: left;
+  display: block; /* Will be overridden as inline-block in highlight styles */
+}
+
+/* Space between the first row and weekday headers */
+.fc-daygrid-day-top {
+  padding-top: 12px;
+}
+
+/* ===== Highlights (placed last, with !important to prevent override) ===== */
+
+/* Today: red circle */
+.fc-daygrid-day.fc-today-custom .fc-daygrid-day-number {
+  position: relative; /* Anchor point for pseudo-element */
+  z-index: 1; /* Ensure the text is above the circle */
+}
+
+.fc-daygrid-day.fc-today-custom .fc-daygrid-day-number::before {
+  content: '';
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 28px;
+  height: 28px;
+  background-color: #ff9999;
+  border-radius: 50%;
+  transform: translate(-50%, -50%);
+  z-index: -1; /* Circle sits below the text */
+}
+
+/* Days with tasks: light blue rectangle */
+.fc-daygrid-day.fc-task-day .fc-daygrid-day-number {
+  position: relative;
+  z-index: 1;
+}
+
+.fc-daygrid-day.fc-task-day .fc-daygrid-day-number::before {
+  content: '';
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 28px;
+  height: 28px;
+  background-color: #cce5ff;
+  border-radius: 0.25rem;
+  transform: translate(-50%, -50%);
+  z-index: -1;
+}

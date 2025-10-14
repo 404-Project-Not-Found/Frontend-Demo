@@ -1,0 +1,48 @@
+@import 'tailwindcss';
+
+:root {
+  --background: #ffd9b3;
+  --foreground: #171717;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --background: #ffd9b3;
+    --foreground: #ededed;
+  }
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: Arial, Helvetica, sans-serif;
+}
+
+.fc {
+  background-color: #fff4e6;
+  border-radius: 0.75rem;
+  padding: 1rem;
+}
+
+.fc-daygrid-day-number {
+  color: #000;
+}
+
+.fc-toolbar-title,
+.fc-col-header-cell {
+  color: #000;
+}
+
+.calendar-square {
+  position: relative;
+  width: clamp(400px, 100vmin, 1000px);
+  aspect-ratio: 1 / 1;
+  margin: 0 auto;
+}
