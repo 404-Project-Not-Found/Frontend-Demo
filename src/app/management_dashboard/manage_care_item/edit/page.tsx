@@ -7,7 +7,6 @@
  * - "Add New Care Item" using the unified FE layer (getTasksFE/saveTasksFE/getTaskCatalogFE).
  * - Client selection follows the same pattern as other pages (shared 3 clients).
  * - Catalog is *flat*; we build Category -> Task titles from it for dropdowns.
- * - Saved tasks use the *calendar-compatible* Task shape from mockApi.ts.
  */
 
 'use client';
