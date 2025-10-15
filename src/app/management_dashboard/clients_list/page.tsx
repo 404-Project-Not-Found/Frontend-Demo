@@ -2,19 +2,20 @@
  * File path: src/app/client_list/page.tsx
  * Frontend Author: Qingyue Zhao
  *
- * Mode Safety:
- * - Mock mode (NEXT_PUBLIC_ENABLE_MOCK=1):
- *    • Pure frontend only — no backend requests.
- *    • Clients come from getClientsFE() in mockApi.
- *    • Organisation access is resolved by priority:
- *        1) FE store override: (clientId, currentOrgId) -> status
- *        2) client.orgAccess
- *        3) 'approved' fallback
- *    • "Request again" updates FE store to 'pending' and updates local UI.
- *    • List listens to 'storage' and visibility changes to refresh.
- * - Real mode:
- *    • Uses session.user.organisation and per-client fetches.
- *    • "Request again" POSTs to backend then refreshes.
+ * Mock mode (NEXT_PUBLIC_ENABLE_MOCK=1):
+ *   • Pure frontend — no backend requests.
+ *   • Clients: getClientsFE() from mockApi.
+ *   • orgAccess resolves by priority:
+ *       1) FE override for (clientId, currentOrgId) in localStorage
+ *       2) client.orgAccess
+ *       3) 'approved' fallback
+ *   • "Request again" saves override 'pending' and updates UI.
+ *   • Page refresh does NOT reset to defaults; only a new mock login (setViewerRoleFE)
+ *     clears and re-seeds.
+ *   • Live sync: 'storage' + 'visibilitychange'.
+ *
+ * Real mode:
+ *   • Uses session.user.organisation + per-client fetches.
  */
 
 'use client';
@@ -27,26 +28,28 @@ import DashboardChrome from '@/components/top_menu/client_schedule';
 import RegisterClientPanel from '@/components/accesscode/registration';
 import { useActiveClient } from '@/context/ActiveClientContext';
 
-// ---- MOCK (FE) helpers ----
+// ---- MOCK helpers ----
 import {
-  isMock,                 // boolean
-  getClientsFE,           // FE-only client list
-  getViewerRoleFE,        // FE-only role
-  getCurrentOrgIdFE,      // FE-only: current org id
-  getOrgStatusForClientFE,// FE-only: override status
-  setOrgStatusForClientFE,// FE-only: set override status
-  
+  isMock,
+  getClientsFE,
+  getViewerRoleFE,
+  getCurrentOrgIdFE,
+  getOrgStatusForClientFE,
+  setOrgStatusForClientFE,
+  seedOrgStatusDefaultsFE,
+  getUsersWithAccessFE,
+  type AccessUser,
   type Client as FEClient,
 } from '@/lib/mock/mockApi';
 
-// ---- REAL data helpers (backend mode) ----
+// ---- REAL helpers ----
 import {
   getViewerRole,
   getClients,
   type Client as ApiClient,
 } from '@/lib/data';
 
-// ------------------ Types ------------------
+// Types
 type OrgAccess = 'approved' | 'pending' | 'revoked';
 
 type Client = {
@@ -101,6 +104,7 @@ function ClientListInner() {
   const [loading, setLoading] = useState(false);
   const [errorText, setErrorText] = useState<string | null>(null);
 
+  // Helper: get latest status from history (real only)
   const latestStatus = (history?: OrgHistEntry[]): OrgAccess => {
     if (!history || history.length === 0) return 'approved';
     const latest = [...history].sort((a, b) => {
@@ -111,16 +115,19 @@ function ClientListInner() {
     return latest?.status ?? 'approved';
   };
 
+  // Load list
   const loadClients = async (realOrgId?: string) => {
     setLoading(true);
     setErrorText(null);
     try {
-      // role
+      // viewer role
       if (isMock) setRole(getViewerRoleFE());
       else setRole(await getViewerRole());
 
-      // mock branch
       if (isMock) {
+        // Seed defaults once per login session
+        seedOrgStatusDefaultsFE();
+
         const list = await getClientsFE();
         const currentOrgId = getCurrentOrgIdFE();
 
@@ -138,7 +145,7 @@ function ClientListInner() {
         return;
       }
 
-      // real branch
+      // Real branch
       const list: ClientWithOrgHist[] = await getClients();
 
       if (!realOrgId) {
@@ -181,6 +188,7 @@ function ClientListInner() {
     }
   };
 
+  // Mount
   useEffect(() => {
     (async () => {
       if (isMock) {
@@ -199,12 +207,11 @@ function ClientListInner() {
     })();
   }, []);
 
-  // listen to FE store updates (mock only)
+  // Live sync (mock only)
   useEffect(() => {
     if (!isMock) return;
-
     const onStorage = (e: StorageEvent) => {
-      if (e.key === 'orgStatusByClient') {
+      if (e.key === 'orgStatusByClient' || e.key === '__org_touch__' || e.key === 'currentOrgId') {
         loadClients();
       }
     };
@@ -224,6 +231,7 @@ function ClientListInner() {
     return t ? clients.filter((c) => c.name.toLowerCase().includes(t)) : clients;
   }, [clients, q]);
 
+  // Guard open
   const tryOpenClient = (c: Client) => {
     if (c.orgAccess !== 'approved') {
       setDenyTarget(c.name);
@@ -235,16 +243,14 @@ function ClientListInner() {
     router.push(`/client_profile?id=${c.id}`);
   };
 
-  // mock: UI-only; real: POST then refresh
+  // Request again
   const requestAccess = async (e: React.MouseEvent, id: string) => {
     e.stopPropagation();
 
     if (isMock) {
       const currentOrgId = getCurrentOrgIdFE();
-      setOrgStatusForClientFE(id, currentOrgId, 'pending'); // override -> pending
-      setClients((prev) =>
-        prev.map((c) => (c.id === id ? { ...c, orgAccess: 'pending' } : c))
-      );
+      setOrgStatusForClientFE(id, currentOrgId, 'pending');
+      setClients((prev) => prev.map((c) => (c.id === id ? { ...c, orgAccess: 'pending' } : c)));
       return;
     }
 
@@ -267,33 +273,22 @@ function ClientListInner() {
   return (
     <DashboardChrome
       page="client-list"
-      clients={[]} // not used here
+      clients={[]}
       onClientChange={(id) => {
         const c = clients.find((cl) => cl.id === id);
-        if (c) {
-          handleClientChange(c.id, c.name);
-        }
+        if (c) handleClientChange(c.id, c.name);
       }}
-      colors={{
-        header: colors.header,
-        banner: colors.banner,
-        text: colors.text,
-      }}
+      colors={{ header: colors.header, banner: colors.banner, text: colors.text }}
       onLogoClick={() => router.push('/empty_dashboard')}
     >
+      {/* Body */}
       <div className="w-full h-full" style={{ backgroundColor: colors.pageBg }}>
         <div className="max-w-[1380px] h-[680px] mx-auto px-6">
-          <div
-            className="w-full mt-6 rounded-t-xl px-6 py-4 text-white text-2xl md:text-3xl font-extrabold"
-            style={{ backgroundColor: colors.header }}
-          >
+          <div className="w-full mt-6 rounded-t-xl px-6 py-4 text-white text-2xl md:text-3xl font-extrabold" style={{ backgroundColor: colors.header }}>
             Client List
           </div>
 
-          <div
-            className="w-full h-[calc(100%-3rem)] rounded-b-xl bg-[#f6efe2] border-x border-b flex flex-col"
-            style={{ borderColor: '#3A000022' }}
-          >
+          <div className="w-full h-[calc(100%-3rem)] rounded-b-xl bg-[#f6efe2] border-x border-b flex flex-col" style={{ borderColor: '#3A000022' }}>
             <div className="flex items-center justify-between px-6 py-4 gap-4">
               <div className="relative flex-1 max-w-[350px]">
                 <input
@@ -313,47 +308,29 @@ function ClientListInner() {
               </button>
             </div>
 
+            {/* List */}
             <div className="flex-1 px-0 pb-6">
               <div
                 className="mx-6 rounded-xl overflow-auto max-h-[500px]"
-                style={{
-                  backgroundColor: '#F2E5D2',
-                  border: '1px solid rgba(58,0,0,0.25)',
-                }}
+                style={{ backgroundColor: '#F2E5D2', border: '1px solid rgba(58,0,0,0.25)' }}
               >
                 {loading ? (
-                  <div className="h-full flex items-center justify-center text-gray-600">
-                    Loading clients...
-                  </div>
+                  <div className="h-full flex items-center justify-center text-gray-600">Loading clients...</div>
                 ) : errorText ? (
-                  <div className="h-full flex items-center justify-center text-red-600">
-                    {errorText}
-                  </div>
+                  <div className="h-full flex items-center justify-center text-red-600">{errorText}</div>
                 ) : filtered.length === 0 ? (
-                  <div className="h-full flex items-center justify-center text-gray-600">
-                    No clients.
-                  </div>
+                  <div className="h-full flex items-center justify-center text-gray-600">No clients.</div>
                 ) : (
                   <ul className="divide-y divide-[rgba(58,0,0,0.15)]">
                     {filtered.map((c) => (
-                      <li
-                        key={c.id}
-                        className="flex items-center justify-between gap-5 px-6 py-6 hover:bg-[rgba(255,255,255,0.6)]"
-                      >
-                        <div
-                          className="flex items-center gap-5 cursor-pointer"
-                          onClick={() => tryOpenClient(c)}
-                        >
+                      <li key={c.id} className="flex items-center justify-between gap-5 px-6 py-6 hover:bg-[rgba(255,255,255,0.6)]">
+                        {/* Left */}
+                        <div className="flex items-center gap-5 cursor-pointer" onClick={() => tryOpenClient(c)}>
                           <div
                             className="shrink-0 rounded-full flex items-center justify-center"
                             style={{
-                              width: 64,
-                              height: 64,
-                              border: '4px solid #3A0000',
-                              backgroundColor: '#fff',
-                              color: '#3A0000',
-                              fontWeight: 900,
-                              fontSize: 20,
+                              width: 64, height: 64, border: '4px solid #3A0000',
+                              backgroundColor: '#fff', color: '#3A0000', fontWeight: 900, fontSize: 20,
                             }}
                             aria-hidden
                           >
@@ -361,21 +338,17 @@ function ClientListInner() {
                           </div>
 
                           <div className="flex flex-col">
-                            <div
-                              className="text-xl md:text-2xl font-semibold"
-                              style={{ color: colors.text }}
-                            >
+                            <div className="text-xl md:text-2xl font-semibold" style={{ color: colors.text }}>
                               {c.name}
                             </div>
                             <div className="mt-1 text-sm flex items-center gap-2 text-black/70">
-                              <span className="opacity-80">
-                                Organisation access:
-                              </span>
+                              <span className="opacity-80">Organisation access:</span>
                               <AccessBadge status={c.orgAccess} />
                             </div>
                           </div>
                         </div>
 
+                        {/* Right actions */}
                         <div className="shrink-0 flex items-center gap-2">
                           {c.orgAccess === 'approved' && (
                             <button
@@ -424,13 +397,11 @@ function ClientListInner() {
         </div>
       </div>
 
+      {/* Access denied modal */}
       {denyOpen && (
         <div className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center">
           <div className="bg-white rounded-2xl shadow-2xl w-[92%] max-w-[520px] p-6 text-center">
-            <h3
-              className="text-xl font-bold mb-2"
-              style={{ color: colors.header }}
-            >
+            <h3 className="text-xl font-bold mb-2" style={{ color: colors.header }}>
               Access required
             </h3>
             {denyReason === 'pending' && (
@@ -460,43 +431,20 @@ function ClientListInner() {
         </div>
       )}
 
-      <RegisterClientPanel
-        open={showRegister}
-        onClose={() => setShowRegister(false)}
-      />
+      <RegisterClientPanel open={showRegister} onClose={() => setShowRegister(false)} />
     </DashboardChrome>
   );
 }
 
 function AccessBadge({ status }: { status: OrgAccess }) {
-  const cfg: Record<
-    OrgAccess,
-    { bg: string; dot: string; label: string; text: string }
-  > = {
-    approved: {
-      bg: 'bg-green-100',
-      dot: 'bg-green-500',
-      label: 'Approved',
-      text: 'text-green-800',
-    },
-    pending: {
-      bg: 'bg-yellow-100',
-      dot: 'bg-yellow-500',
-      label: 'Pending',
-      text: 'text-yellow-800',
-    },
-    revoked: {
-      bg: 'bg-red-100',
-      dot: 'bg-red-500',
-      label: 'Revoked',
-      text: 'text-red-800',
-    },
+  const cfg: Record<OrgAccess, { bg: string; dot: string; label: string; text: string }> = {
+    approved: { bg: 'bg-green-100', dot: 'bg-green-500', label: 'Approved', text: 'text-green-800' },
+    pending:  { bg: 'bg-yellow-100', dot: 'bg-yellow-500', label: 'Pending',  text: 'text-yellow-800' },
+    revoked:  { bg: 'bg-red-100',    dot: 'bg-red-500',    label: 'Revoked',  text: 'text-red-800' },
   };
   const c = cfg[status];
   return (
-    <span
-      className={`inline-flex items-center gap-2 px-2.5 py-1 rounded-full text-xs font-semibold ${c.bg} ${c.text}`}
-    >
+    <span className={`inline-flex items-center gap-2 px-2.5 py-1 rounded-full text-xs font-semibold ${c.bg} ${c.text}`}>
       <span className={`inline-block w-2 h-2 rounded-full ${c.dot}`} />
       {c.label}
     </span>

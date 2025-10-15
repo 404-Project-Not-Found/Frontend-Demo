@@ -4,23 +4,19 @@
  * Dual Mode: Mock (pure frontend) vs Real (backend API).
  *
  * Mock mode (NEXT_PUBLIC_ENABLE_MOCK=1):
- * - Seeds per-client defaults (Alice approved, Bob pending, Cathy revoked)
- *   via seedOrgStatusDefaultsFE() on mount.
- * - Organisation list is built from MOCK_ORGS but effective status resolves
- *   by priority:
- *     1) FE store override: (clientId, orgId) -> 'approved' | 'pending' | 'revoked'
- *     2) Fallback to MOCK_ORGS status (active -> approved, pending, revoked)
- * - The current management organisation is labeled as "Test Organisation".
- * - Actions (Approve/Reject/Revoke) update local UI and persist override when
- *   acting on the current management organisation, so the management view
- *   reflects the latest status.
- * - List listens to 'storage' and 'visibilitychange' to refresh when another
- *   view (e.g., management list) changes state (e.g., "Request again").
- * - No network requests are performed.
+ * - Per-login seeding (once per session) via seedOrgStatusDefaultsFE().
+ * - Effective status priority:
+ *     1) FE override (clientId, currentOrgId) from localStorage
+ *     2) Fallback to MOCK_ORGS (active → approved; pending; revoked)
+ * - The current management organisation is labeled "Test Organisation".
+ * - Actions (Approve/Reject/Revoke) update local UI and persist override
+ *   when acting on the current management organisation.
+ * - List listens to 'storage' and 'visibilitychange' for live sync.
+ * - Page refresh does NOT reset to defaults. New defaults only on re-login
+ *   (mock login changes happen through setViewerRoleFE()).
  *
  * Real mode:
- * - Uses backend API (GET/POST) to load and update organisation access.
- * - After POST, refetches the list for consistency.
+ * - GET/POST to backend and refetch after changes.
  */
 
 'use client';
@@ -67,12 +63,10 @@ export default function ManageOrganisationAccessPage() {
   const [loading, setLoading] = useState(false);
   const [errorText, setErrorText] = useState<string | null>(null);
 
-  // In mock mode, current management org id (defaults 'org1')
+  // In mock mode: current management org id (defaults to 'org1')
   const currentMgrOrgId = isMock ? getCurrentOrgIdFE() : undefined;
 
-  /* ---------------------------
-   * Load clients for top chrome
-   * --------------------------- */
+  // Load clients for top chrome
   useEffect(() => {
     (async () => {
       try {
@@ -85,18 +79,13 @@ export default function ManageOrganisationAccessPage() {
     })();
   }, []);
 
-  /* --------------------------------------
-   * Build organisations list (mock helper)
-   * -------------------------------------- */
+  // Build organisations list from mock store
   const hydrateFromMock = React.useCallback(
     (clientId: string) => {
       const seeded = (MOCK_ORGS ?? []).map((o) => {
-        const override = getOrgStatusForClientFE(clientId, o.id) as
-          | OrgStatus
-          | undefined;
+        const override = getOrgStatusForClientFE(clientId, o.id) as OrgStatus | undefined;
         return {
           id: o.id,
-          // Label current management organisation as "Test Organisation"
           name: o.id === currentMgrOrgId ? 'Test Organisation' : o.name,
           status: override ?? toUI(o.status),
         } as Organisation;
@@ -106,9 +95,7 @@ export default function ManageOrganisationAccessPage() {
     [currentMgrOrgId]
   );
 
-  /* --------------------------------------
-   * Load organisations for the activeClient
-   * -------------------------------------- */
+  // Load orgs for the active client
   useEffect(() => {
     if (!activeClient?.id) {
       setOrgs([]);
@@ -120,13 +107,14 @@ export default function ManageOrganisationAccessPage() {
     setErrorText(null);
 
     if (isMock) {
-      // Ensure initial per-client defaults are available in FE store
+      // Seed once per session (no reset on refresh)
       seedOrgStatusDefaultsFE();
       hydrateFromMock(activeClient.id);
       setLoading(false);
       return;
     }
 
+    // Real mode
     (async () => {
       try {
         const res = await fetch(
@@ -146,13 +134,11 @@ export default function ManageOrganisationAccessPage() {
     })();
   }, [activeClient?.id, hydrateFromMock]);
 
-  /* ------------------------------------------------------
-   * Respond to FE store changes triggered by other views
-   * ------------------------------------------------------ */
+  // Live sync on storage + visibility (mock only)
   useEffect(() => {
     if (!isMock) return;
     const onStorage = (e: StorageEvent) => {
-      if (e.key === 'orgStatusByClient' && activeClient?.id) {
+      if ((e.key === 'orgStatusByClient' || e.key === '__org_touch__' || e.key === 'currentOrgId') && activeClient?.id) {
         hydrateFromMock(activeClient.id);
       }
     };
@@ -169,9 +155,7 @@ export default function ManageOrganisationAccessPage() {
     };
   }, [hydrateFromMock, activeClient?.id]);
 
-  /* -------------
-   * Actions (UI)
-   * ------------- */
+  // Actions
   async function updateOrgStatus(
     orgId: string,
     action: 'approve' | 'reject' | 'revoke'
@@ -179,23 +163,25 @@ export default function ManageOrganisationAccessPage() {
     if (!activeClient?.id) return;
 
     if (isMock) {
-      // Compute next status
       const nextStatus: OrgStatus = action === 'approve' ? 'approved' : 'revoked';
 
-      // Update local UI
+      // Update UI immediately
       setOrgs((prev) =>
         prev.map((o) => (o.id === orgId ? { ...o, status: nextStatus } : o))
       );
 
-      // Persist override if acting on the current management org
-      if (orgId === currentMgrOrgId) {
-        setOrgStatusForClientFE(activeClient.id, orgId, nextStatus);
-        // Management view will pick this change via 'storage' or on visibility
-      }
+      // Persist override for the current management org
+      setOrgStatusForClientFE(activeClient.id, orgId, nextStatus);
+
+      // 3) 可选：通知其它标签刷新
+      try {
+        localStorage.setItem('__org_touch__', String(Date.now()));
+        localStorage.removeItem('__org_touch__');
+      } catch {}
       return;
     }
 
-    // Real mode: POST then refetch
+    // Real: POST then refetch
     setLoading(true);
     setErrorText(null);
     try {
@@ -240,11 +226,7 @@ export default function ManageOrganisationAccessPage() {
       page="organisation-access"
       clients={chromeClients}
       onClientChange={onClientChange}
-      colors={{
-        header: colors.header,
-        banner: colors.notice,
-        text: colors.text,
-      }}
+      colors={{ header: colors.header, banner: colors.notice, text: colors.text }}
     >
       {/* Page body */}
       <div className="w-full h-full" style={{ backgroundColor: colors.pageBg }}>
@@ -270,10 +252,7 @@ export default function ManageOrganisationAccessPage() {
             style={{ borderColor: 'transparent' }}
           >
             {/* Notice */}
-            <div
-              className="w-full px-5 py-3 text-black"
-              style={{ backgroundColor: colors.notice }}
-            >
+            <div className="w-full px-5 py-3 text-black" style={{ backgroundColor: colors.notice }}>
               <p className="text-center font-semibold">
                 Privacy Notice: This information is visible only to the family / POA
                 and will not be shared with anyone.
@@ -301,10 +280,7 @@ export default function ManageOrganisationAccessPage() {
                     onRemove={(id) => updateOrgStatus(id, 'reject')}
                   />
                   <hr className="my-5 border-black" />
-                  <Group
-                    title="Revoked Organisations"
-                    items={orgs.filter((o) => o.status === 'revoked')}
-                  />
+                  <Group title="Revoked Organisations" items={orgs.filter((o) => o.status === 'revoked')} />
                 </>
               )}
             </div>
@@ -315,7 +291,7 @@ export default function ManageOrganisationAccessPage() {
   );
 }
 
-/* ---------- Group list block ---------- */
+/* ---------- Group block ---------- */
 function Group({
   title,
   items,
@@ -340,12 +316,9 @@ function Group({
       ) : (
         <ul className="space-y-2">
           {items.map((item) => (
-            <li
-              key={item.id}
-              className="flex text-lg items-center justify-between"
-            >
+            <li key={item.id} className="flex text-lg items-center justify-between">
               <div>{item.name}</div>
-              <div className="flex items-center gap-3 ">
+              <div className="flex items-center gap-3">
                 {item.status === 'approved' && onRevoke && (
                   <button
                     onClick={() => onRevoke(item.id)}
