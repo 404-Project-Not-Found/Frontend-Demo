@@ -47,8 +47,9 @@
 
 export const isMock = process.env.NEXT_PUBLIC_ENABLE_MOCK === '1';
 
-export const FULL_DASH_ID = 'mock1'; // Mock Alice (full dashboard)
-export const PARTIAL_DASH_ID = 'mock2'; // Mock Bob (partial dashboard)
+export const FULL_DASH_ID = 'mock1';       // Mock Alice (full dashboard)
+export const PARTIAL_DASH_ID = 'mock2';    // Mock Bob (partial dashboard)
+export const CATHY_ID = 'mock-cathy';      // Mock Cathy (full dashboard)
 
 export const LS_ACTIVE_CLIENT_ID = 'activeClientId';
 export const LS_CURRENT_CLIENT_NAME = 'currentClientName';
@@ -59,7 +60,7 @@ export const LS_CURRENT_CLIENT_NAME = 'currentClientName';
 
 export type ViewerRole = 'family' | 'carer' | 'management';
 export const LS_ACTIVE_ROLE = 'activeRole'; // long-lived
-export const SS_MOCK_ROLE = 'mockRole'; // session-scoped for mock
+export const SS_MOCK_ROLE = 'mockRole';     // session-scoped for mock
 
 export function setViewerRoleFE(role: ViewerRole): void {
   if (typeof window === 'undefined') return;
@@ -121,7 +122,7 @@ export type Organisation = {
 export const NAME_BY_ID: Record<string, string> = {
   [FULL_DASH_ID]: 'Mock Alice',
   [PARTIAL_DASH_ID]: 'Mock Bob',
-  'mock-cathy': 'Mock Cathy',
+  [CATHY_ID]: 'Mock Cathy',
 };
 
 export function readActiveClientFromStorage(): {
@@ -141,6 +142,99 @@ export function writeActiveClientToStorage(id: string, name?: string) {
   if (name) localStorage.setItem(LS_CURRENT_CLIENT_NAME, name);
 }
 
+/* ---------------------------------------------
+ * FE store for per-(client, org) access status
+ * ---------------------------------------------
+ * Key layout in localStorage:
+ *   'currentOrgId'           -> string (e.g., 'org1')
+ *   'orgStatusByClient'      -> JSON: { [clientId]: { [orgId]: 'approved'|'pending'|'revoked' } }
+ */
+
+type OrgStatusFE = 'approved' | 'pending' | 'revoked';
+type OrgStatusMap = Record<string, Record<string, OrgStatusFE>>;
+const ORG_STATUS_BY_CLIENT_KEY = 'orgStatusByClient';
+
+export function getCurrentOrgIdFE(): string {
+  if (typeof window === 'undefined') return 'org1';
+  return localStorage.getItem('currentOrgId') || 'org1';
+}
+
+export function setCurrentOrgIdFE(id: string) {
+  if (typeof window === 'undefined') return;
+  localStorage.setItem('currentOrgId', id);
+}
+
+function readStatusMap(): OrgStatusMap {
+  try {
+    const raw = localStorage.getItem(ORG_STATUS_BY_CLIENT_KEY);
+    if (raw) return JSON.parse(raw);
+  } catch {}
+  return {};
+}
+
+function writeStatusMap(m: OrgStatusMap) {
+  try {
+    localStorage.setItem(ORG_STATUS_BY_CLIENT_KEY, JSON.stringify(m));
+  } catch {}
+}
+
+/** Read override for (clientId, orgId); returns undefined if not set. */
+export function getOrgStatusForClientFE(
+  clientId: string,
+  orgId: string
+): OrgStatusFE | undefined {
+  const m = readStatusMap();
+  return m[clientId]?.[orgId];
+}
+
+/** Persist override for (clientId, orgId) and emit storage. */
+export function setOrgStatusForClientFE(
+  clientId: string,
+  orgId: string,
+  status: OrgStatusFE
+) {
+  const m = readStatusMap();
+  m[clientId] = m[clientId] || {};
+  m[clientId][orgId] = status;
+  writeStatusMap(m);
+}
+
+/**
+ * Seed per-client initial org status (only when missing):
+ * - mock1 (Alice) -> approved
+ * - mock2 (Bob)   -> pending
+ * - mock-cathy    -> revoked
+ */
+export function seedOrgStatusDefaultsFE() {
+  if (typeof window === 'undefined') return;
+  const orgId = getCurrentOrgIdFE();
+  const m = readStatusMap();
+
+  const ensure = (clientId: string, status: OrgStatusFE) => {
+    m[clientId] = m[clientId] || {};
+    if (!m[clientId][orgId]) {
+      m[clientId][orgId] = status;
+    }
+  };
+
+  ensure(FULL_DASH_ID, 'approved');   // Alice
+  ensure(PARTIAL_DASH_ID, 'pending'); // Bob
+  ensure(CATHY_ID, 'revoked');        // Cathy
+
+  writeStatusMap(m);
+}
+
+/** Optional: mock organisations for UI demo (unchanged) */
+export const MOCK_ORGS: Organisation[] = [
+  { id: 'org1', name: 'Sunrise Care', status: 'active' },
+  { id: 'org2', name: 'North Clinic', status: 'pending' },
+  { id: 'org3', name: 'Old Town Care', status: 'revoked' },
+];
+
+/* ==========
+ * Clients API (FE)
+ * ========== */
+
 /** Fetch all clients (mock or backend) */
 export async function getClientsFE(): Promise<Client[]> {
   if (isMock) {
@@ -148,34 +242,34 @@ export async function getClientsFE(): Promise<Client[]> {
       orgAccess?: 'approved' | 'pending' | 'revoked';
     })[] = [
       {
-        _id: 'mock1',
+        _id: FULL_DASH_ID,
         name: 'Mock Alice',
         dob: '1943-09-19',
         dashboardType: 'full',
         accessCode: '',
         notes: [],
         avatarUrl: '',
-        orgAccess: 'approved',
+        orgAccess: 'approved', // Alice initial
       },
       {
-        _id: 'mock2',
+        _id: PARTIAL_DASH_ID,
         name: 'Mock Bob',
         dob: '1950-01-02',
         dashboardType: 'partial',
         accessCode: '',
         notes: [],
         avatarUrl: '',
-        orgAccess: 'approved',
+        orgAccess: 'pending', // Bob initial
       },
       {
-        _id: 'mock-cathy',
+        _id: CATHY_ID,
         name: 'Mock Cathy',
         dob: '1962-11-05',
         dashboardType: 'full',
         accessCode: '',
         notes: [],
         avatarUrl: '',
-        orgAccess: 'approved',
+        orgAccess: 'revoked', // Cathy initial
       },
     ];
     return baseClients;
@@ -192,7 +286,7 @@ export async function getClientByIdFE(id: string): Promise<Client | null> {
   if (isMock) {
     const mockData: Client[] = [
       {
-        _id: 'mock1',
+        _id: FULL_DASH_ID,
         name: 'Mock Alice',
         dob: '1943-09-19',
         dashboardType: 'full',
@@ -202,7 +296,7 @@ export async function getClientByIdFE(id: string): Promise<Client | null> {
         orgAccess: 'pending',
       },
       {
-        _id: 'mock2',
+        _id: PARTIAL_DASH_ID,
         name: 'Mock Bob',
         dob: '1950-01-02',
         dashboardType: 'partial',
@@ -212,7 +306,7 @@ export async function getClientByIdFE(id: string): Promise<Client | null> {
         orgAccess: 'pending',
       },
       {
-        _id: 'mock-cathy',
+        _id: CATHY_ID,
         name: 'Mock Cathy',
         dob: '1962-11-05',
         dashboardType: 'full',
@@ -229,13 +323,6 @@ export async function getClientByIdFE(id: string): Promise<Client | null> {
   if (!res.ok) return null;
   return (await res.json()) as Client;
 }
-
-/** Optional: mock organisations for UI demo */
-export const MOCK_ORGS: Organisation[] = [
-  { id: 'org1', name: 'Sunrise Care', status: 'active' },
-  { id: 'org2', name: 'North Clinic', status: 'pending' },
-  { id: 'org3', name: 'Old Town Care', status: 'revoked' },
-];
 
 /* ==========
  * Tasks API
@@ -307,7 +394,7 @@ export async function getTasksFE(): Promise<Task[]> {
       if (raw) {
         const parsed: unknown = JSON.parse(raw);
         if (Array.isArray(parsed) && parsed.length > 0) {
-          // 🛠️ Ensure clientId is present (migrate old data)
+          // Ensure clientId is present (migrate old data)
           const hydrated = parsed.map((t, idx): Task => {
             const partial = t as Partial<Task>;
             return {
@@ -531,7 +618,7 @@ const MOCK_BUDGET_BY_CLIENT: Record<string, BudgetRow[]> = {
     { item: 'Shampoo', category: 'Hygiene', allocated: 50, spent: 45 },
     { item: 'Jacket', category: 'Clothing', allocated: 200, spent: 120 },
   ],
-  'mock-cathy': [
+  [CATHY_ID]: [
     { item: 'Eye Test', category: 'Appointments', allocated: 500, spent: 100 },
     { item: 'Body Wash', category: 'Hygiene', allocated: 40, spent: 15 },
     { item: 'Shoes', category: 'Clothing', allocated: 300, spent: 280 },
@@ -573,7 +660,7 @@ const DEMO_TRANSACTIONS: Transaction[] = [
   // Mock Alice (mock1)
   {
     id: 't1',
-    clientId: 'mock1',
+    clientId: FULL_DASH_ID,
     type: 'Purchase',
     date: '2025-09-20',
     madeBy: 'Carer John',
@@ -582,7 +669,7 @@ const DEMO_TRANSACTIONS: Transaction[] = [
   },
   {
     id: 't2',
-    clientId: 'mock1',
+    clientId: FULL_DASH_ID,
     type: 'Refund',
     date: '2025-09-21',
     madeBy: 'Family Alice',
@@ -591,7 +678,7 @@ const DEMO_TRANSACTIONS: Transaction[] = [
   },
   {
     id: 't3',
-    clientId: 'mock1',
+    clientId: FULL_DASH_ID,
     type: 'Purchase',
     date: '2025-09-28',
     madeBy: 'Carer Mary',
@@ -602,7 +689,7 @@ const DEMO_TRANSACTIONS: Transaction[] = [
   // Mock Bob (mock2)
   {
     id: 't4',
-    clientId: 'mock2',
+    clientId: PARTIAL_DASH_ID,
     type: 'Purchase',
     date: '2025-09-22',
     madeBy: 'Family Bob',
@@ -611,7 +698,7 @@ const DEMO_TRANSACTIONS: Transaction[] = [
   },
   {
     id: 't5',
-    clientId: 'mock2',
+    clientId: PARTIAL_DASH_ID,
     type: 'Purchase',
     date: '2025-09-24',
     madeBy: 'Carer David',
@@ -688,7 +775,7 @@ export async function addTransactionFE(tx: Transaction): Promise<void> {
 
 export type RequestLog = {
   id: string;
-  clientId: string;
+  clientId: string
   task: string;
   change: string;
   requestedBy: string;
@@ -816,7 +903,7 @@ const MOCK_USERS_BY_CLIENT: Record<string, AccessUser[]> = {
       role: 'carer',
     },
   ],
-  'mock-cathy': [
+  [CATHY_ID]: [
     {
       id: 'u-emma-family',
       name: 'Emma Clark',

@@ -1,14 +1,26 @@
 /**
  * File path: /family_dashboard/manage_org_access/[clientId]/page.tsx
- * Mode: Dual (mock = pure-frontend; real = call backend)
  *
- * - Mock mode (NEXT_PUBLIC_ENABLE_MOCK=1):
- *     * Seed from mockApi.MOCK_ORGS
- *     * Actions (Approve/Reject/Revoke) only update local state
- *     * No fetch, no persistence
- * - Real mode:
- *     * GET/POST to API routes
- *     * After POST, re-fetch list
+ * Dual Mode: Mock (pure frontend) vs Real (backend API).
+ *
+ * Mock mode (NEXT_PUBLIC_ENABLE_MOCK=1):
+ * - Seeds per-client defaults (Alice approved, Bob pending, Cathy revoked)
+ *   via seedOrgStatusDefaultsFE() on mount.
+ * - Organisation list is built from MOCK_ORGS but effective status resolves
+ *   by priority:
+ *     1) FE store override: (clientId, orgId) -> 'approved' | 'pending' | 'revoked'
+ *     2) Fallback to MOCK_ORGS status (active -> approved, pending, revoked)
+ * - The current management organisation is labeled as "Test Organisation".
+ * - Actions (Approve/Reject/Revoke) update local UI and persist override when
+ *   acting on the current management organisation, so the management view
+ *   reflects the latest status.
+ * - List listens to 'storage' and 'visibilitychange' to refresh when another
+ *   view (e.g., management list) changes state (e.g., "Request again").
+ * - No network requests are performed.
+ *
+ * Real mode:
+ * - Uses backend API (GET/POST) to load and update organisation access.
+ * - After POST, refetches the list for consistency.
  */
 
 'use client';
@@ -18,7 +30,15 @@ import { useRouter } from 'next/navigation';
 import DashboardChrome from '@/components/top_menu/client_schedule';
 import { useActiveClient } from '@/context/ActiveClientContext';
 import { getClients, type Client as ApiClient } from '@/lib/data';
-import { isMock, MOCK_ORGS } from '@/lib/mock/mockApi';
+
+import {
+  isMock,
+  MOCK_ORGS,
+  getCurrentOrgIdFE,
+  getOrgStatusForClientFE,
+  setOrgStatusForClientFE,
+  seedOrgStatusDefaultsFE,
+} from '@/lib/mock/mockApi';
 
 const colors = {
   pageBg: '#ffd9b3',
@@ -39,15 +59,20 @@ export default function ManageOrganisationAccessPage() {
   const router = useRouter();
   const { client: activeClient, handleClientChange } = useActiveClient();
 
-  // ---------- Clients ----------
+  // Top chrome clients
   const [clients, setClients] = useState<ClientLite[]>([]);
 
-  // ---------- Orgs ----------
+  // Organisation rows
   const [orgs, setOrgs] = useState<Organisation[]>([]);
   const [loading, setLoading] = useState(false);
   const [errorText, setErrorText] = useState<string | null>(null);
 
-  // Load clients
+  // In mock mode, current management org id (defaults 'org1')
+  const currentMgrOrgId = isMock ? getCurrentOrgIdFE() : undefined;
+
+  /* ---------------------------
+   * Load clients for top chrome
+   * --------------------------- */
   useEffect(() => {
     (async () => {
       try {
@@ -60,7 +85,30 @@ export default function ManageOrganisationAccessPage() {
     })();
   }, []);
 
-  // Load orgs for current client
+  /* --------------------------------------
+   * Build organisations list (mock helper)
+   * -------------------------------------- */
+  const hydrateFromMock = React.useCallback(
+    (clientId: string) => {
+      const seeded = (MOCK_ORGS ?? []).map((o) => {
+        const override = getOrgStatusForClientFE(clientId, o.id) as
+          | OrgStatus
+          | undefined;
+        return {
+          id: o.id,
+          // Label current management organisation as "Test Organisation"
+          name: o.id === currentMgrOrgId ? 'Test Organisation' : o.name,
+          status: override ?? toUI(o.status),
+        } as Organisation;
+      });
+      setOrgs(seeded);
+    },
+    [currentMgrOrgId]
+  );
+
+  /* --------------------------------------
+   * Load organisations for the activeClient
+   * -------------------------------------- */
   useEffect(() => {
     if (!activeClient?.id) {
       setOrgs([]);
@@ -72,19 +120,13 @@ export default function ManageOrganisationAccessPage() {
     setErrorText(null);
 
     if (isMock) {
-      // --- Mock: seed locally, no network ---
-      const seeded =
-        (MOCK_ORGS ?? []).map((o) => ({
-          id: o.id,
-          name: o.name,
-          status: toUI(o.status),
-        })) as Organisation[];
-      setOrgs(seeded);
+      // Ensure initial per-client defaults are available in FE store
+      seedOrgStatusDefaultsFE();
+      hydrateFromMock(activeClient.id);
       setLoading(false);
       return;
     }
 
-    // --- Real: fetch from API ---
     (async () => {
       try {
         const res = await fetch(
@@ -102,27 +144,58 @@ export default function ManageOrganisationAccessPage() {
         setLoading(false);
       }
     })();
-  }, [activeClient?.id]);
+  }, [activeClient?.id, hydrateFromMock]);
 
-  // ---- Actions ----
-  async function updateOrgStatus(orgId: string, action: 'approve' | 'reject' | 'revoke') {
+  /* ------------------------------------------------------
+   * Respond to FE store changes triggered by other views
+   * ------------------------------------------------------ */
+  useEffect(() => {
+    if (!isMock) return;
+    const onStorage = (e: StorageEvent) => {
+      if (e.key === 'orgStatusByClient' && activeClient?.id) {
+        hydrateFromMock(activeClient.id);
+      }
+    };
+    const onVis = () => {
+      if (document.visibilityState === 'visible' && activeClient?.id) {
+        hydrateFromMock(activeClient.id);
+      }
+    };
+    window.addEventListener('storage', onStorage);
+    document.addEventListener('visibilitychange', onVis);
+    return () => {
+      window.removeEventListener('storage', onStorage);
+      document.removeEventListener('visibilitychange', onVis);
+    };
+  }, [hydrateFromMock, activeClient?.id]);
+
+  /* -------------
+   * Actions (UI)
+   * ------------- */
+  async function updateOrgStatus(
+    orgId: string,
+    action: 'approve' | 'reject' | 'revoke'
+  ) {
     if (!activeClient?.id) return;
 
     if (isMock) {
-      // Mock: local-only transition
+      // Compute next status
+      const nextStatus: OrgStatus = action === 'approve' ? 'approved' : 'revoked';
+
+      // Update local UI
       setOrgs((prev) =>
-        prev.map((o) => {
-          if (o.id !== orgId) return o;
-          if (action === 'approve') return { ...o, status: 'approved' };
-          if (action === 'revoke') return { ...o, status: 'revoked' };
-          if (action === 'reject') return { ...o, status: 'revoked' }; // or remove if desired
-          return o;
-        })
+        prev.map((o) => (o.id === orgId ? { ...o, status: nextStatus } : o))
       );
+
+      // Persist override if acting on the current management org
+      if (orgId === currentMgrOrgId) {
+        setOrgStatusForClientFE(activeClient.id, orgId, nextStatus);
+        // Management view will pick this change via 'storage' or on visibility
+      }
       return;
     }
 
-    // Real: POST then re-fetch
+    // Real mode: POST then refetch
     setLoading(true);
     setErrorText(null);
     try {
@@ -151,7 +224,7 @@ export default function ManageOrganisationAccessPage() {
     }
   }
 
-  // Handle client change from dropdown
+  // Top chrome client switch
   const onClientChange = (id: string) => {
     const selected = clients.find((c) => c.id === id);
     if (!selected) return;
@@ -176,7 +249,7 @@ export default function ManageOrganisationAccessPage() {
       {/* Page body */}
       <div className="w-full h-full" style={{ backgroundColor: colors.pageBg }}>
         <div className="w-full h-full">
-          {/* Section header with back button */}
+          {/* Header */}
           <div
             className="w-full px-6 py-4 flex items-center justify-between text-white text-2xl md:text-3xl font-extrabold"
             style={{ backgroundColor: colors.header }}
@@ -191,19 +264,19 @@ export default function ManageOrganisationAccessPage() {
             </button>
           </div>
 
-          {/* Content area */}
+          {/* Content */}
           <div
             className="w-full h-[630px] rounded-b-xl bg-[#f6efe2] border-x border-b flex flex-col"
             style={{ borderColor: 'transparent' }}
           >
-            {/* Notice bar */}
+            {/* Notice */}
             <div
               className="w-full px-5 py-3 text-black"
               style={{ backgroundColor: colors.notice }}
             >
               <p className="text-center font-semibold">
-                Privacy Notice: This information is visible only to you (family
-                / POA) and will not be shared with anyone.
+                Privacy Notice: This information is visible only to the family / POA
+                and will not be shared with anyone.
               </p>
             </div>
 
@@ -300,6 +373,9 @@ function Group({
                       </button>
                     )}
                   </>
+                )}
+                {item.status === 'revoked' && !onRevoke && !onApprove && !onRemove && (
+                  <span className="text-slate-700">Revoked</span>
                 )}
               </div>
             </li>

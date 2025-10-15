@@ -2,20 +2,19 @@
  * File path: src/app/client_list/page.tsx
  * Frontend Author: Qingyue Zhao
  *
- * Features (latest update):
- * - Displays client list with avatar, name, and organisation access status.
- * - Organisation access statuses: approved / pending / revoked.
- * - Approved client rows:
- *      -> show "View profile" button (navigates to dashboard).
- * - Pending / Revoked client rows:
- *      -> clicking row opens a centered modal explaining why access is denied.
- * - Management-only actions:
- *      -> revoked: "Request again" button (enabled).
- *      -> pending: "Request sent" button (disabled).
- * - Now fetches all mock/demo clients purely from mockApi (no hardcoding here).
- *
- * Last Updated by Denise Alexander - 7/10/2025: back-end integrated to fetch client lists
- * from DB.
+ * Mode Safety:
+ * - Mock mode (NEXT_PUBLIC_ENABLE_MOCK=1):
+ *    • Pure frontend only — no backend requests.
+ *    • Clients come from getClientsFE() in mockApi.
+ *    • Organisation access is resolved by priority:
+ *        1) FE store override: (clientId, currentOrgId) -> status
+ *        2) client.orgAccess
+ *        3) 'approved' fallback
+ *    • "Request again" updates FE store to 'pending' and updates local UI.
+ *    • List listens to 'storage' and visibility changes to refresh.
+ * - Real mode:
+ *    • Uses session.user.organisation and per-client fetches.
+ *    • "Request again" POSTs to backend then refreshes.
  */
 
 'use client';
@@ -27,30 +26,43 @@ import { getSession } from 'next-auth/react';
 import DashboardChrome from '@/components/top_menu/client_schedule';
 import RegisterClientPanel from '@/components/accesscode/registration';
 import { useActiveClient } from '@/context/ActiveClientContext';
+
+// ---- MOCK (FE) helpers ----
+import {
+  isMock,                 // boolean
+  getClientsFE,           // FE-only client list
+  getViewerRoleFE,        // FE-only role
+  getCurrentOrgIdFE,      // FE-only: current org id
+  getOrgStatusForClientFE,// FE-only: override status
+  setOrgStatusForClientFE,// FE-only: set override status
+  
+  type Client as FEClient,
+} from '@/lib/mock/mockApi';
+
+// ---- REAL data helpers (backend mode) ----
 import {
   getViewerRole,
   getClients,
   type Client as ApiClient,
 } from '@/lib/data';
 
-// ------------------ Type Definitions ------------------
+// ------------------ Types ------------------
 type OrgAccess = 'approved' | 'pending' | 'revoked';
 
-// Client type for front-end usage
 type Client = {
   id: string;
   name: string;
   dashboardType?: 'full' | 'partial';
   orgAccess: OrgAccess;
 };
-// Organisation history entry returned by API
+
 type OrgHistEntry = {
   status: OrgAccess;
   createdAt: string;
   updatedAt: string;
   organisation?: { _id: string; name: string };
 };
-// Extended client type with optional organisation history
+
 type ClientWithOrgHist = ApiClient & {
   organisationHistory?: OrgHistEntry[];
 };
@@ -61,14 +73,11 @@ const colors = {
   banner: '#F9C9B1',
   header: '#3A0000',
   text: '#2b2b2b',
-  help: '#ff9999',
 };
 
 export default function ClientListPage() {
   return (
-    <Suspense
-      fallback={<div className="p-6 text-gray-600">Loading clients…</div>}
-    >
+    <Suspense fallback={<div className="p-6 text-gray-600">Loading clients…</div>}>
       <ClientListInner />
     </Suspense>
   );
@@ -78,92 +87,143 @@ function ClientListInner() {
   const router = useRouter();
   const { handleClientChange } = useActiveClient();
 
-  // ---- Current viewer role (carer / family / management) ----
   const [role, setRole] = useState<'carer' | 'family' | 'management'>('family');
-
-  // ---- Clients state ----
   const [clients, setClients] = useState<Client[]>([]);
   const [q, setQ] = useState('');
 
-  // ---- Modal: access denied ----
   const [denyOpen, setDenyOpen] = useState(false);
   const [denyTarget, setDenyTarget] = useState<string>('');
   const [denyReason, setDenyReason] = useState<OrgAccess>('pending');
 
-  // ---- Drawer: register new client ----
   const [showRegister, setShowRegister] = useState(false);
-  const addNewClient = () => setShowRegister(true);
 
   const [orgId, setOrgId] = useState<string | undefined>();
+  const [loading, setLoading] = useState(false);
+  const [errorText, setErrorText] = useState<string | null>(null);
 
-  // ---- Load clients ----
-  const loadClients = async (orgId: string) => {
+  const latestStatus = (history?: OrgHistEntry[]): OrgAccess => {
+    if (!history || history.length === 0) return 'approved';
+    const latest = [...history].sort((a, b) => {
+      const at = new Date(a.updatedAt ?? a.createdAt).getTime();
+      const bt = new Date(b.updatedAt ?? b.createdAt).getTime();
+      return bt - at;
+    })[0];
+    return latest?.status ?? 'approved';
+  };
+
+  const loadClients = async (realOrgId?: string) => {
+    setLoading(true);
+    setErrorText(null);
     try {
-      // Current user's role
-      const viewerRole = await getViewerRole();
-      setRole(viewerRole);
+      // role
+      if (isMock) setRole(getViewerRoleFE());
+      else setRole(await getViewerRole());
 
-      // Fetches all clients
-      const list: ClientWithOrgHist[] = await getClients();
+      // mock branch
+      if (isMock) {
+        const list = await getClientsFE();
+        const currentOrgId = getCurrentOrgIdFE();
 
-      // Maps clients to include their latest organisation status
-      const mapped: Client[] = await Promise.all(
-        list.map(async (c) => {
-          const res = await fetch(
-            `/api/v1/clients/${c._id}/organisations/${orgId}`
-          );
-          const history = (await res.json()) as OrgHistEntry[];
-
-          // Sort by updatedAt or createdAt descending
-          const latestOrg = history.sort((a, b) => {
-            const aTime = new Date(a.updatedAt ?? a.createdAt).getTime();
-            const bTime = new Date(b.updatedAt ?? b.createdAt).getTime();
-            return bTime - aTime;
-          })[0];
+        const mapped: Client[] = (list as FEClient[]).map((c) => {
+          const override = getOrgStatusForClientFE(c._id, currentOrgId) as OrgAccess | undefined;
           return {
             id: c._id,
             name: c.name,
             dashboardType: c.dashboardType,
-            orgAccess: latestOrg?.status ?? 'pending',
+            orgAccess: override ?? ((c.orgAccess as OrgAccess) ?? 'approved'),
           };
-        })
-      );
-      // Update state with mapped clients
-      setClients(mapped);
-    } catch (err) {
-      console.error('Error loading clients.', err);
-      setClients([]);
-    }
-  };
+        });
 
-  // --- Fetches oragnisation ID and loads clients on mount ---
-  useEffect(() => {
-    const fetchOrgId = async () => {
-      const session = await getSession();
-      const orgId = session?.user?.organisation as string | undefined;
-
-      if (!orgId) {
-        console.error('No organisation linked to this account.');
+        setClients(mapped);
         return;
       }
 
-      setOrgId(orgId);
+      // real branch
+      const list: ClientWithOrgHist[] = await getClients();
 
-      await loadClients(orgId);
-    };
+      if (!realOrgId) {
+        setErrorText('No organisation linked to this account.');
+        setClients([]);
+        return;
+      }
 
-    fetchOrgId();
+      const mapped: Client[] = await Promise.all(
+        list.map(async (c) => {
+          const res = await fetch(
+            `/api/v1/clients/${c._id}/organisations/${realOrgId}`,
+            { cache: 'no-store' }
+          );
+          if (!res.ok) {
+            return {
+              id: c._id,
+              name: c.name,
+              dashboardType: c.dashboardType,
+              orgAccess: 'pending',
+            };
+          }
+          const history = (await res.json()) as OrgHistEntry[];
+          return {
+            id: c._id,
+            name: c.name,
+            dashboardType: c.dashboardType,
+            orgAccess: latestStatus(history),
+          };
+        })
+      );
+
+      setClients(mapped);
+    } catch (err) {
+      console.error('Error loading clients.', err);
+      setErrorText('Failed to load clients.');
+      setClients([]);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    (async () => {
+      if (isMock) {
+        await loadClients();
+        return;
+      }
+      const session = await getSession();
+      const org = session?.user?.organisation as string | undefined;
+      if (!org) {
+        setErrorText('No organisation linked to this account.');
+        setClients([]);
+        return;
+      }
+      setOrgId(org);
+      await loadClients(org);
+    })();
   }, []);
 
-  // ---- Search filter ----
+  // listen to FE store updates (mock only)
+  useEffect(() => {
+    if (!isMock) return;
+
+    const onStorage = (e: StorageEvent) => {
+      if (e.key === 'orgStatusByClient') {
+        loadClients();
+      }
+    };
+    const onVis = () => {
+      if (document.visibilityState === 'visible') loadClients();
+    };
+    window.addEventListener('storage', onStorage);
+    document.addEventListener('visibilitychange', onVis);
+    return () => {
+      window.removeEventListener('storage', onStorage);
+      document.removeEventListener('visibilitychange', onVis);
+    };
+  }, []);
+
   const filtered = useMemo(() => {
     const t = q.trim().toLowerCase();
-    return t
-      ? clients.filter((c) => c.name.toLowerCase().includes(t))
-      : clients;
+    return t ? clients.filter((c) => c.name.toLowerCase().includes(t)) : clients;
   }, [clients, q]);
 
-  // ---- Navigation guard ----
   const tryOpenClient = (c: Client) => {
     if (c.orgAccess !== 'approved') {
       setDenyTarget(c.name);
@@ -171,15 +231,23 @@ function ClientListInner() {
       setDenyOpen(true);
       return;
     }
-
     handleClientChange(c.id, c.name);
-
     router.push(`/client_profile?id=${c.id}`);
   };
 
-  // ---- Management: request access again ----
+  // mock: UI-only; real: POST then refresh
   const requestAccess = async (e: React.MouseEvent, id: string) => {
-    e.stopPropagation(); // avoid row navigation
+    e.stopPropagation();
+
+    if (isMock) {
+      const currentOrgId = getCurrentOrgIdFE();
+      setOrgStatusForClientFE(id, currentOrgId, 'pending'); // override -> pending
+      setClients((prev) =>
+        prev.map((c) => (c.id === id ? { ...c, orgAccess: 'pending' } : c))
+      );
+      return;
+    }
+
     if (!orgId) {
       console.error('No organisation linked to this account.');
       return;
@@ -213,10 +281,8 @@ function ClientListInner() {
       }}
       onLogoClick={() => router.push('/empty_dashboard')}
     >
-      {/* Page body */}
       <div className="w-full h-full" style={{ backgroundColor: colors.pageBg }}>
         <div className="max-w-[1380px] h-[680px] mx-auto px-6">
-          {/* Section title */}
           <div
             className="w-full mt-6 rounded-t-xl px-6 py-4 text-white text-2xl md:text-3xl font-extrabold"
             style={{ backgroundColor: colors.header }}
@@ -224,14 +290,11 @@ function ClientListInner() {
             Client List
           </div>
 
-          {/* Controls + List */}
           <div
             className="w-full h-[calc(100%-3rem)] rounded-b-xl bg-[#f6efe2] border-x border-b flex flex-col"
             style={{ borderColor: '#3A000022' }}
           >
-            {/* Controls */}
             <div className="flex items-center justify-between px-6 py-4 gap-4">
-              {/* Search bar */}
               <div className="relative flex-1 max-w-[350px]">
                 <input
                   value={q}
@@ -241,9 +304,8 @@ function ClientListInner() {
                   style={{ borderColor: '#3A0000' }}
                 />
               </div>
-              {/* CTA: Register new client */}
               <button
-                onClick={addNewClient}
+                onClick={() => setShowRegister(true)}
                 className="rounded-xl px-5 py-3 text-lg font-bold text-white hover:opacity-90"
                 style={{ backgroundColor: colors.header }}
               >
@@ -251,7 +313,6 @@ function ClientListInner() {
               </button>
             </div>
 
-            {/* List area */}
             <div className="flex-1 px-0 pb-6">
               <div
                 className="mx-6 rounded-xl overflow-auto max-h-[500px]"
@@ -260,9 +321,17 @@ function ClientListInner() {
                   border: '1px solid rgba(58,0,0,0.25)',
                 }}
               >
-                {filtered.length === 0 ? (
+                {loading ? (
                   <div className="h-full flex items-center justify-center text-gray-600">
                     Loading clients...
+                  </div>
+                ) : errorText ? (
+                  <div className="h-full flex items-center justify-center text-red-600">
+                    {errorText}
+                  </div>
+                ) : filtered.length === 0 ? (
+                  <div className="h-full flex items-center justify-center text-gray-600">
+                    No clients.
                   </div>
                 ) : (
                   <ul className="divide-y divide-[rgba(58,0,0,0.15)]">
@@ -271,12 +340,10 @@ function ClientListInner() {
                         key={c.id}
                         className="flex items-center justify-between gap-5 px-6 py-6 hover:bg-[rgba(255,255,255,0.6)]"
                       >
-                        {/* Left: avatar + name */}
                         <div
                           className="flex items-center gap-5 cursor-pointer"
                           onClick={() => tryOpenClient(c)}
                         >
-                          {/* Avatar circle */}
                           <div
                             className="shrink-0 rounded-full flex items-center justify-center"
                             style={{
@@ -293,7 +360,6 @@ function ClientListInner() {
                             {c.name.charAt(0).toUpperCase()}
                           </div>
 
-                          {/* Name + access badge */}
                           <div className="flex flex-col">
                             <div
                               className="text-xl md:text-2xl font-semibold"
@@ -310,9 +376,7 @@ function ClientListInner() {
                           </div>
                         </div>
 
-                        {/* Right-side actions */}
                         <div className="shrink-0 flex items-center gap-2">
-                          {/* Approved -> View profile */}
                           {c.orgAccess === 'approved' && (
                             <button
                               onClick={(e) => {
@@ -326,7 +390,6 @@ function ClientListInner() {
                             </button>
                           )}
 
-                          {/* Management actions (non-approved only) */}
                           {c.orgAccess !== 'approved' && (
                             <>
                               {c.orgAccess === 'revoked' && (
@@ -335,18 +398,14 @@ function ClientListInner() {
                                   className="px-4 py-2 rounded-lg text-white text-sm font-semibold hover:opacity-90"
                                   style={{ backgroundColor: colors.header }}
                                 >
-                                  Request
+                                  Request again
                                 </button>
                               )}
                               {c.orgAccess === 'pending' && (
                                 <button
                                   onClick={(e) => e.stopPropagation()}
                                   className="px-4 py-2 rounded-lg text-sm font-semibold cursor-not-allowed"
-                                  style={{
-                                    backgroundColor: '#b07b7b',
-                                    color: 'white',
-                                    opacity: 0.9,
-                                  }}
+                                  style={{ backgroundColor: '#b07b7b', color: 'white', opacity: 0.9 }}
                                   disabled
                                 >
                                   Request sent
@@ -365,7 +424,6 @@ function ClientListInner() {
         </div>
       </div>
 
-      {/* ---- Access denied modal ---- */}
       {denyOpen && (
         <div className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center">
           <div className="bg-white rounded-2xl shadow-2xl w-[92%] max-w-[520px] p-6 text-center">
@@ -377,15 +435,14 @@ function ClientListInner() {
             </h3>
             {denyReason === 'pending' && (
               <p className="text-black/80">
-                Your request to access <b>{denyTarget}</b>’s profile is still
-                pending.
+                The request to access <b>{denyTarget}</b>’s profile is still pending.
                 <br />
-                Please wait until the family implements your request.
+                Please wait until the family implements the request.
               </p>
             )}
             {denyReason === 'revoked' && (
               <p className="text-black/80">
-                Your access to <b>{denyTarget}</b> has been revoked.
+                Access to <b>{denyTarget}</b> has been revoked.
                 <br />
                 To regain access, please submit a new request.
               </p>
@@ -403,7 +460,6 @@ function ClientListInner() {
         </div>
       )}
 
-      {/* Right-side registration drawer */}
       <RegisterClientPanel
         open={showRegister}
         onClose={() => setShowRegister(false)}
@@ -412,7 +468,6 @@ function ClientListInner() {
   );
 }
 
-/* ---- Badge component: shows access status visually ---- */
 function AccessBadge({ status }: { status: OrgAccess }) {
   const cfg: Record<
     OrgAccess,
