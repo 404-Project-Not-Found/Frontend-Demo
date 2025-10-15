@@ -1,113 +1,134 @@
+/**
+ * File path: app/calendar_dashboard/transaction_history/page.tsx
+ * Author: Qingyue Zhao
+ *
+ * Features:
+ * - Client dropdown shows ONLY org-approved clients (like Budget Report).
+ * - Management can change status via a badge-styled <select>; others see read-only badges.
+ * - When status becomes "Implemented", budget.spent updates (handled in mockApi.ts).
+ * - Receipt column: DataURL first; if not available, falls back to /public/receipts/<filename>.
+ */
+
 'use client';
 
-import React, { useState, useEffect, useMemo, Suspense } from 'react';
+import React, { useEffect, useMemo, useState, Suspense } from 'react';
 import { useRouter } from 'next/navigation';
 import DashboardChrome from '@/components/top_menu/client_schedule';
+import Badge from '@/components/ui/Badge';
 
 import {
   getViewerRoleFE,
   getClientsFE,
   readActiveClientFromStorage,
   writeActiveClientToStorage,
-  type Client as ApiClient,
   getTransactionsFE,
+  setTransactionStatusFE,
+  getCurrentOrgIdFE,
+  seedOrgStatusDefaultsFE,
+  getOrgStatusForClientFE,
+  type Client as ApiClient,
+  type Transaction as ApiTransaction,
 } from '@/lib/mock/mockApi';
 
-/** Data shape returned by getTransactionsFE() */
-type ApiTransaction = {
-  id: string;
-  clientId: string;
-  type: string;
-  date: string;
-  madeBy: string;
-  items: string[];
-  receipt: string;
-};
-
-const colors = {
-  header: '#3A0000',
-  banner: '#F9C9B1',
-  text: '#000000',
-};
+const colors = { header: '#3A0000', banner: '#F9C9B1', text: '#000000' };
 
 export default function TransactionHistoryPage() {
   return (
-    <Suspense
-      fallback={<div className="p-6 text-gray-600">Loading transactions…</div>}
-    >
+    <Suspense fallback={<div className="p-6 text-gray-600">Loading transactions…</div>}>
       <TransactionHistoryInner />
     </Suspense>
   );
 }
 
+/* -------------------------- UI helpers -------------------------- */
+function statusTone(s?: ApiTransaction['status']): 'green' | 'yellow' | 'red' {
+  switch (s) {
+    case 'Approved': return 'green';
+    case 'Rejected': return 'red';
+    default: return 'yellow';
+  }
+}
+function statusSelectClass(s?: ApiTransaction['status']): string {
+  const base =
+    'rounded-full px-3 py-1 text-sm font-semibold border focus:outline-none focus:ring-2 appearance-none pr-7';
+  switch (s) {
+    case 'Approved': return `${base} bg-green-100 text-green-800 border-green-300 focus:ring-green-300`;
+    case 'Rejected': return `${base} bg-red-100 text-red-800 border-red-300 focus:ring-red-300`;
+    default: return `${base} bg-yellow-100 text-yellow-800 border-yellow-300 focus:ring-yellow-300`;
+  }
+}
+function SelectCaret() {
+  return <span className="pointer-events-none -ml-6 inline-block translate-y-[1px] text-black/50">▾</span>;
+}
+
+/** Build client list gated by org access (approved only) */
+async function loadClientsWithOrgAccess(): Promise<
+  { id: string; name: string; orgAccess: 'approved' | 'pending' | 'revoked' }[]
+> {
+  const all = await getClientsFE();
+  seedOrgStatusDefaultsFE();
+  const orgId = getCurrentOrgIdFE();
+  return all.map((c: ApiClient) => {
+    const s = getOrgStatusForClientFE(c._id, orgId) || 'pending';
+    return { id: c._id, name: c.name, orgAccess: s };
+  });
+}
+
+/* ----------------------------- Page ----------------------------- */
 function TransactionHistoryInner() {
   const router = useRouter();
 
-  const [role, setRole] = useState<string | null>(null);
-  useEffect(() => {
-    setRole(getViewerRoleFE());
-  }, []);
+  // role
+  const [role, setRole] = useState<'family' | 'carer' | 'management' | null>(null);
+  useEffect(() => { setRole(getViewerRoleFE()); }, []);
   const isCarer = role === 'carer';
-  /** ---------------------------------------------------------------- */
+  const isManagement = role === 'management';
 
-  // Clients for pink banner select
-  const [clients, setClients] = useState<{ id: string; name: string }[]>([]);
+  // clients
+  const [clients, setClients] = useState<
+    { id: string; name: string; orgAccess: 'approved' | 'pending' | 'revoked' }[]
+  >([]);
   const [activeClientId, setActiveClientId] = useState<string | null>(null);
   const [activeClientName, setActiveClientName] = useState<string>('');
-
-  // Transactions
-  const [rows, setRows] = useState<ApiTransaction[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [errorText, setErrorText] = useState('');
-
-  // Filters
-  const [search, setSearch] = useState<string>('');
-
-  /** Load clients */
   useEffect(() => {
     (async () => {
       try {
-        const list = await getClientsFE();
-        const mapped = list.map((c: ApiClient) => ({
-          id: c._id,
-          name: c.name,
-        }));
-        setClients(mapped);
-
+        const list = await loadClientsWithOrgAccess();
+        setClients(list);
+        const approved = list.filter((c) => c.orgAccess === 'approved');
         const { id, name } = readActiveClientFromStorage();
-        const useId = id || mapped[0]?.id || null;
-        const useName =
-          name || (mapped.find((m) => m.id === useId)?.name ?? '');
+        let useId: string | null = null;
+        let useName = '';
+        if (id && approved.find((c) => c.id === id)) {
+          useId = id; useName = name || approved.find((a) => a.id === id)?.name || '';
+        } else if (approved.length > 0) {
+          useId = approved[0].id; useName = approved[0].name;
+        }
         setActiveClientId(useId);
         setActiveClientName(useName);
-      } catch {
-        setClients([]);
-      }
+        if (useId) writeActiveClientToStorage(useId, useName);
+      } catch { setClients([]); }
     })();
   }, []);
 
-  /** Load transactions when active client changes */
+  // transactions
+  const [rows, setRows] = useState<ApiTransaction[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [errorText, setErrorText] = useState('');
   useEffect(() => {
-    if (!activeClientId) {
-      setRows([]);
-      return;
-    }
     (async () => {
-      setLoading(true);
-      setErrorText('');
+      if (!activeClientId) { setRows([]); return; }
+      setLoading(true); setErrorText('');
       try {
         const data = await getTransactionsFE(activeClientId);
         setRows(Array.isArray(data) ? data : []);
       } catch {
         setErrorText('Failed to load transactions for this client.');
         setRows([]);
-      } finally {
-        setLoading(false);
-      }
+      } finally { setLoading(false); }
     })();
   }, [activeClientId]);
 
-  /** Pink banner select  */
   const onClientChange = (id: string) => {
     const c = clients.find((x) => x.id === id) || null;
     const name = c?.name || '';
@@ -116,49 +137,46 @@ function TransactionHistoryInner() {
     writeActiveClientToStorage(id || '', name);
   };
 
-  /** Filter */
+  // search
+  const [search, setSearch] = useState('');
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
     if (!q) return rows;
     return rows.filter((t) =>
-      [t.type, t.date, t.madeBy, t.receipt, ...t.items]
-        .join(' ')
-        .toLowerCase()
-        .includes(q)
+      [
+        t.type, t.date, t.madeBy, t.category, t.item,
+        String(t.amount), t.status || '', t.receiptFilename || '',
+      ].join(' ').toLowerCase().includes(q)
     );
   }, [rows, search]);
+
+  // status update
+  const updateStatus = async (txId: string, next: NonNullable<ApiTransaction['status']>) => {
+    await setTransactionStatusFE(txId, next);
+    if (activeClientId) {
+      const data = await getTransactionsFE(activeClientId);
+      setRows(Array.isArray(data) ? data : []);
+    }
+  };
 
   return (
     <DashboardChrome
       page="transactions"
       clients={clients}
-      activeClientId={activeClientId}
       onClientChange={onClientChange}
-      activeClientName={activeClientName}
       colors={colors}
       onLogoClick={() => router.push('/empty_dashboard')}
     >
-      {/* Main content */}
       <div className="flex-1 h-[680px] bg-white/80 overflow-auto">
-        {/* Header bar */}
-        <div
-          className="w-full flex items-center justify-between px-6 py-5"
-          style={{ backgroundColor: colors.header }}
-        >
-          {/* Left side: Title */}
+        {/* Header */}
+        <div className="w-full flex items-center justify-between px-6 py-5" style={{ backgroundColor: colors.header }}>
           <h1 className="text-2xl font-bold text-white">Transaction History</h1>
-
-          {/* Right side: Add button + Search bar */}
           <div className="flex items-center gap-7">
             {isCarer && (
               <button
                 className="px-4 py-2 rounded-md font-semibold text-black"
                 style={{ backgroundColor: '#FFA94D' }}
-                onClick={() =>
-                  router.push(
-                    '/calendar_dashboard/budget_report/add_transaction'
-                  )
-                }
+                onClick={() => router.push('/calendar_dashboard/budget_report/add_transaction')}
               >
                 Add new transaction
               </button>
@@ -175,7 +193,7 @@ function TransactionHistoryInner() {
           </div>
         </div>
 
-        {/* Table full width */}
+        {/* Table */}
         <div className="w-full overflow-auto">
           {loading ? (
             <div className="p-6 text-gray-600">Loading transactions…</div>
@@ -188,50 +206,79 @@ function TransactionHistoryInner() {
                   <th className="p-5">Type</th>
                   <th className="p-5">Date</th>
                   <th className="p-5">Made By</th>
+                  <th className="p-5">Category</th>
+                  <th className="p-5">Item</th>
+                  <th className="p-5">Amount</th>
+                  <th className="p-5">Status</th>
                   <th className="p-5">Receipt</th>
-                  <th className="p-5">Associated Care Items</th>
                 </tr>
               </thead>
               <tbody>
                 {filtered.length > 0 ? (
                   filtered.map((t) => (
-                    <tr
-                      key={t.id}
-                      className="border-b hover:bg-[#fff6ea] transition"
-                    >
+                    <tr key={t.id} className="border-b hover:bg-[#fff6ea] transition">
                       <td className="p-5 font-semibold">{t.type}</td>
                       <td className="p-5">{t.date}</td>
                       <td className="p-5">{t.madeBy}</td>
-                      <td className="p-5">{t.receipt}</td>
+                      <td className="p-5">{t.category}</td>
+                      <td className="p-5">{t.item}</td>
+                      <td className="p-5">${Number(t.amount || 0).toLocaleString()}</td>
+
+                      {/* Status */}
                       <td className="p-5">
-                        <div className="flex flex-col gap-1">
-                          {t.items.map((i, idx) => (
-                            <div
-                              key={idx}
-                              className="flex items-center justify-between gap-2"
+                        {isManagement ? (
+                          <div className="inline-flex items-center">
+                            <select
+                              value={t.status || 'Pending'}
+                              onChange={(e) =>
+                                updateStatus(t.id, e.target.value as 'Pending' | 'Approved' | 'Rejected')
+                              }
+                              className={statusSelectClass(t.status)}
+                              aria-label="Change status"
+                              title="Change status"
                             >
-                              <span>{i}</span>
-                              {isCarer && (
-                                <button
-                                  className="px-2 py-1 text-xs bg-[#3d0000] text-white rounded"
-                                  onClick={() =>
-                                    router.push('/calendar_dashboard')
-                                  }
-                                >
-                                  View Care Item
-                                </button>
-                              )}
-                            </div>
-                          ))}
-                        </div>
+                              <option value="Pending">Pending</option>
+                              <option value="Approved">Approved</option>
+                              <option value="Rejected">Rejected</option>
+                            </select>
+                            <SelectCaret />
+                          </div>
+                        ) : (
+                          <Badge tone={statusTone(t.status)}>{t.status || 'Pending'}</Badge>
+                        )}
+                      </td>
+
+                      {/* Receipt */}
+                      <td className="p-5">
+                        {t.receiptDataUrl ? (
+                          <a
+                            href={t.receiptDataUrl}
+                            target="_blank"
+                            rel="noreferrer"
+                            download={t.receiptFilename || 'receipt'}
+                            className="underline hover:opacity-80"
+                          >
+                            {t.receiptFilename ? t.receiptFilename : 'Open receipt'}
+                          </a>
+                        ) : t.receiptFilename ? (
+                          <a
+                            href={`/receipts/${encodeURIComponent(t.receiptFilename)}`}
+                            target="_blank"
+                            rel="noreferrer"
+                            download
+                            className="underline hover:opacity-80"
+                          >
+                            {t.receiptFilename}
+                          </a>
+                        ) : (
+                          <span className="text-black/50">—</span>
+                        )}
                       </td>
                     </tr>
                   ))
                 ) : (
                   <tr>
-                    <td colSpan={5} className="p-8 text-center text-gray-500">
-                      No transactions for this client.
-                    </td>
+                    <td colSpan={8} className="p-8 text-center text-gray-500">No transactions for this client.</td>
                   </tr>
                 )}
               </tbody>

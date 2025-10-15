@@ -1,6 +1,13 @@
-/*
- * File path: /calendar_dashboard/add_transaction/page.tsx
- * Frontend Author: Devni Wijesinghe (refactor to use DashboardChrome by QY)
+/**
+ * File path: app/calendar_dashboard/budget_report/add_transaction/page.tsx
+ * Frontend Author: Devni Wijesinghe (refactor & org-access + mockApi wiring by QY)
+ *
+ * What this page does now:
+ * - Client dropdown shows ONLY clients the current org has APPROVED access to (same logic as Org Access pages).
+ * - Carer/Family can submit a new transaction with receipt (stored as Data URL in mockApi).
+ * - Management can also add transactions if you keep the button visible; typically Carer uses this page.
+ * - On save we create a "Pending" transaction via addTransactionFE(); management later sets status.
+ * - Category & Item come from the client's current Budget rows (so Implemented can roll into Budget spent).
  */
 
 'use client';
@@ -8,16 +15,20 @@
 import React, { useEffect, useMemo, useRef, useState, Suspense } from 'react';
 import { useRouter } from 'next/navigation';
 import DashboardChrome from '@/components/top_menu/client_schedule';
-import { useTransactions } from '@/context/TransactionContext';
+import Badge from '@/components/ui/Badge';
 
 import {
+  getViewerRoleFE,
   getClientsFE,
   readActiveClientFromStorage,
   writeActiveClientToStorage,
+  getBudgetRowsFE,
+  addTransactionFE,
+  getCurrentOrgIdFE,
+  seedOrgStatusDefaultsFE,
+  getOrgStatusForClientFE,
   type Client as ApiClient,
-  getTaskCatalogFE,
-  getTasksFE,
-  type Task as ApiTask,
+  type BudgetRow,
 } from '@/lib/mock/mockApi';
 
 const colors = {
@@ -29,8 +40,6 @@ const colors = {
   header: '#3A0000',
   help: '#ED5F4F',
   btnPill: '#D2BCAF',
-  btnPillHover: '#C7AEA0',
-  fileBtn: '#E8D8CE',
 };
 
 export default function AddTransactionPage() {
@@ -41,123 +50,168 @@ export default function AddTransactionPage() {
   );
 }
 
+/** Convert a File to Data URL (for mockApi to persist the receipt for all roles) */
+async function fileToDataUrl(file: File): Promise<string> {
+  return await new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error('Failed to read file'));
+    reader.onload = () => resolve(String(reader.result || ''));
+    reader.readAsDataURL(file);
+  });
+}
+
+/** Build clients list with org-access (approved|pending|revoked) for the CURRENT org */
+async function loadClientsWithOrgAccess(): Promise<
+  { id: string; name: string; orgAccess: 'approved' | 'pending' | 'revoked' }[]
+> {
+  const all = await getClientsFE();
+  // Ensure default statuses exist for this session (Alice approved, Bob pending, Cathy revoked)
+  seedOrgStatusDefaultsFE();
+  const orgId = getCurrentOrgIdFE();
+  return all.map((c: ApiClient) => {
+    const s = getOrgStatusForClientFE(c._id, orgId) || 'pending';
+    return { id: c._id, name: c.name, orgAccess: s };
+  });
+}
+
 function AddTransactionInner() {
   const router = useRouter();
-  const { addTransaction } = useTransactions();
 
-  /* ---------- Top bar client dropdown ---------- */
-  const [clients, setClients] = useState<{ id: string; name: string }[]>([]);
+  /* ---------- Role (only used for showing hints/buttons if you want) ---------- */
+  const [role, setRole] = useState<'family' | 'carer' | 'management'>('family');
+  useEffect(() => {
+    setRole(getViewerRoleFE());
+  }, []);
+
+  /* ---------- Top banner client dropdown (access-controlled) ---------- */
+  const [clients, setClients] = useState<
+    { id: string; name: string; orgAccess: 'approved' | 'pending' | 'revoked' }[]
+  >([]);
   const [activeClientId, setActiveClientId] = useState<string | null>(null);
   const [activeClientName, setActiveClientName] = useState<string>('');
 
   useEffect(() => {
     (async () => {
       try {
-        const list = await getClientsFE();
-        const mapped = list.map((c: ApiClient) => ({
-          id: c._id,
-          name: c.name,
-        }));
-        setClients(mapped);
+        const list = await loadClientsWithOrgAccess();
+        setClients(list);
 
+        // Initialize from storage if available AND still approved; fallback to first approved
         const { id, name } = readActiveClientFromStorage();
-        const useId = id || mapped[0]?.id || null;
-        const useName =
-          name || (mapped.find((m) => m.id === useId)?.name ?? '');
+        const approved = list.filter((c) => c.orgAccess === 'approved');
+        let useId: string | null = null;
+        let useName = '';
+
+        if (id && approved.find((c) => c.id === id)) {
+          useId = id;
+          useName = name || approved.find((a) => a.id === id)?.name || '';
+        } else if (approved.length > 0) {
+          useId = approved[0].id;
+          useName = approved[0].name;
+        }
+
         setActiveClientId(useId);
         setActiveClientName(useName);
+        if (useId) writeActiveClientToStorage(useId, useName);
       } catch {
         setClients([]);
+        setActiveClientId(null);
+        setActiveClientName('');
       }
     })();
   }, []);
 
   const onClientChange = (id: string) => {
-    const c = clients.find((x) => x.id === id) || null;
+    if (!id) {
+      setActiveClientId(null);
+      setActiveClientName('');
+      writeActiveClientToStorage('', '');
+      return;
+    }
+    const c = clients.find((x) => x.id === id);
     const name = c?.name || '';
-    setActiveClientId(id || null);
+    setActiveClientId(id);
     setActiveClientName(name);
-    writeActiveClientToStorage(id || '', name);
+    writeActiveClientToStorage(id, name);
   };
 
-  /* ---------- Care Item Catalog + Tasks ---------- */
-  const [allTasks, setAllTasks] = useState<ApiTask[]>([]);
-  const catalog = useMemo(() => getTaskCatalogFE(), []); // 返回 [{category, tasks:[{label}]}]
-
-  const labelToCategory = useMemo(() => {
-    const m = new Map<string, string>();
-    catalog.forEach((c) => c.tasks.forEach((t) => m.set(t.label, c.category)));
-    return m;
-  }, [catalog]);
-
+  /* ---------- Load Budget rows to drive Category/Item ---------- */
+  const [rows, setRows] = useState<BudgetRow[]>([]);
   useEffect(() => {
     (async () => {
+      if (!activeClientId) {
+        setRows([]);
+        return;
+      }
       try {
-        const list = await getTasksFE();
-        setAllTasks(list || []);
+        const r = await getBudgetRowsFE(activeClientId);
+        setRows(r || []);
       } catch {
-        setAllTasks([]);
+        setRows([]);
       }
     })();
-  }, []);
+  }, [activeClientId]);
+
+  const categories = useMemo(
+    () => Array.from(new Set(rows.map((r) => r.category))),
+    [rows]
+  );
+  const itemsForCategory = useMemo(
+    () => (cat: string) => rows.filter((r) => r.category === cat).map((r) => r.item),
+    [rows]
+  );
 
   /* ---------- Form state ---------- */
   const [category, setCategory] = useState('');
-  const [taskName, setTaskName] = useState('');
+  const [item, setItem] = useState('');
   const [date, setDate] = useState('');
-  const [carer, setCarer] = useState('');
+  const [madeBy, setMadeBy] = useState('');
+  const [amount, setAmount] = useState<string>(''); // string input; parse on save
   const [receiptFile, setReceiptFile] = useState<File | null>(null);
-
   const fileInputRef = useRef<HTMLInputElement | null>(null);
-
-  // 根据 clientId + category 过滤 tasks
-  const tasksForClient = useMemo(() => {
-    if (!activeClientId) return [];
-    return (allTasks || []).filter((t) => t.clientId === activeClientId);
-  }, [allTasks, activeClientId]);
-
-  const tasksForClientAndCategory = useMemo(() => {
-    if (!category) return [];
-    return tasksForClient.filter((t: ApiTask) => {
-      const cat = t.category || labelToCategory.get(t.title) || '';
-      return cat.toLowerCase() === category.toLowerCase();
-    });
-  }, [tasksForClient, category, labelToCategory]);
-
-  const handleSubmit = () => {
-    if (!activeClientId) {
-      alert('Please select a client in the pink banner first.');
-      return;
-    }
-    if (!category || !taskName || !date || !carer || !receiptFile) {
-      alert(
-        'Please complete Category, Name, Date, Carer, and upload a receipt.'
-      );
-      return;
-    }
-
-    addTransaction({
-      type: category,
-      date,
-      madeBy: carer,
-      receipt: receiptFile.name,
-      items: [taskName],
-    });
-
-    router.push('/calendar_dashboard/transaction_history');
-  };
 
   const inputCls =
     'h-12 w-[600px] rounded-sm px-3 bg-white text-black outline-none border';
   const inputStyle = { borderColor: colors.inputBorder };
 
+  const handleSubmit = async () => {
+    if (!activeClientId) {
+      alert('Please select a client in the pink banner first.');
+      return;
+    }
+    const amt = parseFloat(amount);
+    if (!category || !item || !date || !madeBy || !receiptFile || !Number.isFinite(amt)) {
+      alert('Please complete Category, Item, Date, Carer, Amount and upload a receipt.');
+      return;
+    }
+
+    // Persist receipt as Data URL so all roles can open it
+    const dataUrl = await fileToDataUrl(receiptFile);
+
+    await addTransactionFE({
+      clientId: activeClientId,
+      type: 'Purchase',
+      date,
+      madeBy,
+      category,
+      item,
+      amount: amt,
+      receiptDataUrl: dataUrl,
+      receiptMimeType: receiptFile.type,
+      receiptFilename: receiptFile.name,
+      status: 'Pending', // Management will change to Implemented later
+    });
+
+    // Back to history
+    router.push('/calendar_dashboard/transaction_history');
+  };
+
   return (
     <DashboardChrome
       page="transactions"
+      /** Pass full list; the chrome will auto-hide non-approved for management */
       clients={clients}
-      activeClientId={activeClientId}
       onClientChange={onClientChange}
-      activeClientName={activeClientName}
       colors={{ header: colors.header, banner: colors.banner, text: '#000' }}
       onLogoClick={() => router.push('/empty_dashboard')}
     >
@@ -172,9 +226,7 @@ function AddTransactionInner() {
         >
           <span>Add Transaction</span>
           <button
-            onClick={() =>
-              router.push('/calendar_dashboard/transaction_history')
-            }
+            onClick={() => router.push('/calendar_dashboard/transaction_history')}
             className="text-lg font-semibold text-white hover:underline"
           >
             &lt; Back
@@ -182,56 +234,50 @@ function AddTransactionInner() {
         </div>
 
         {/* Form area */}
-        <div className="w-full max-w-[1120px] mx-auto px-25 py-15">
+        <div className="w-full max-w-[1120px] mx-auto px-10 py-10">
           <div className="grid grid-cols-[280px_1fr] gap-y-8 gap-x-10">
             {/* Category */}
-            <label
-              className="self-center text-2xl font-extrabold"
-              style={{ color: colors.label }}
-            >
-              Care Item Category
+            <label className="self-center text-2xl font-extrabold" style={{ color: colors.label }}>
+              Category
             </label>
             <select
               value={category}
               onChange={(e) => {
                 setCategory(e.target.value);
-                setTaskName('');
+                setItem('');
               }}
               className={`${inputCls} appearance-none`}
               style={inputStyle}
             >
               <option value="">- Select a category -</option>
-              {catalog.map((c) => (
-                <option key={c.category} value={c.category}>
-                  {c.category}
+              {categories.map((c) => (
+                <option key={c} value={c}>
+                  {c}
                 </option>
               ))}
             </select>
 
-            {/* Care Item Sub Category */}
-            <label
-              className="self-center text-2xl font-extrabold"
-              style={{ color: colors.label }}
-            >
-              Care Item Sub Category
+            {/* Item */}
+            <label className="self-center text-2xl font-extrabold" style={{ color: colors.label }}>
+              Item
             </label>
             <select
-              value={taskName}
-              onChange={(e) => setTaskName(e.target.value)}
-              disabled={!activeClientId || !category}
+              value={item}
+              onChange={(e) => setItem(e.target.value)}
+              disabled={!category}
               className={`${inputCls} appearance-none`}
               style={inputStyle}
             >
               {!category ? (
                 <option value="">- Select a category first -</option>
-              ) : tasksForClientAndCategory.length === 0 ? (
-                <option value="">No tasks available</option>
+              ) : itemsForCategory(category).length === 0 ? (
+                <option value="">No items available</option>
               ) : (
                 <>
-                  <option value="">Select a Care Item</option>
-                  {tasksForClientAndCategory.map((t: ApiTask) => (
-                    <option key={t.id} value={t.title}>
-                      {t.title}
+                  <option value="">Select an item</option>
+                  {itemsForCategory(category).map((it) => (
+                    <option key={it} value={it}>
+                      {it}
                     </option>
                   ))}
                 </>
@@ -239,10 +285,7 @@ function AddTransactionInner() {
             </select>
 
             {/* Date */}
-            <label
-              className="self-center text-2xl font-extrabold"
-              style={{ color: colors.label }}
-            >
+            <label className="self-center text-2xl font-extrabold" style={{ color: colors.label }}>
               Date
             </label>
             <input
@@ -253,27 +296,36 @@ function AddTransactionInner() {
               style={inputStyle}
             />
 
-            {/* Carer Name */}
-            <label
-              className="self-center text-2xl font-extrabold"
-              style={{ color: colors.label }}
-            >
-              Carer Name
+            {/* Made By */}
+            <label className="self-center text-2xl font-extrabold" style={{ color: colors.label }}>
+              Made By
             </label>
             <input
               type="text"
-              value={carer}
-              onChange={(e) => setCarer(e.target.value)}
+              value={madeBy}
+              onChange={(e) => setMadeBy(e.target.value)}
               className={inputCls}
               style={inputStyle}
-              placeholder="Enter carer name"
+              placeholder="Enter your name"
+            />
+
+            {/* Amount */}
+            <label className="self-center text-2xl font-extrabold" style={{ color: colors.label }}>
+              Amount
+            </label>
+            <input
+              type="number"
+              min="0"
+              step="0.01"
+              value={amount}
+              onChange={(e) => setAmount(e.target.value)}
+              className={inputCls}
+              style={inputStyle}
+              placeholder="e.g. 25.50"
             />
 
             {/* Upload Receipt */}
-            <label
-              className="self-center text-2xl font-extrabold"
-              style={{ color: colors.label }}
-            >
+            <label className="self-center text-2xl font-extrabold" style={{ color: colors.label }}>
               Upload Receipt
             </label>
             <div className="flex items-center gap-4">
@@ -291,7 +343,7 @@ function AddTransactionInner() {
                 onClick={() => fileInputRef.current?.click()}
                 className="px-4 py-2 rounded-md font-semibold"
                 style={{
-                  backgroundColor: colors.fileBtn,
+                  backgroundColor: '#E8D8CE',
                   border: `1px solid ${colors.inputBorder}`,
                   color: '#1a1a1a',
                 }}
@@ -309,9 +361,7 @@ function AddTransactionInner() {
             <button
               className="px-8 py-3 rounded-2xl text-2xl font-extrabold"
               style={{ backgroundColor: colors.btnPill, color: '#1a1a1a' }}
-              onClick={() =>
-                router.push('/calendar_dashboard/transaction_history')
-              }
+              onClick={() => router.push('/calendar_dashboard/transaction_history')}
             >
               Cancel
             </button>
@@ -322,6 +372,13 @@ function AddTransactionInner() {
             >
               Add
             </button>
+          </div>
+
+          {/* Note */}
+          <div className="mt-8 text-sm text-black/70">
+            <Badge tone="yellow">Pending</Badge>{' '}
+            Management can update the status to <Badge tone="green">Implemented</Badge> later,
+            which auto-updates the Budget’s “Spent”.
           </div>
         </div>
       </div>

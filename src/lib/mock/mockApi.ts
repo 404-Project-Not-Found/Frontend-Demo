@@ -6,7 +6,7 @@
  * Mock mode (NEXT_PUBLIC_ENABLE_MOCK=1):
  *   - Clients: hardcoded mock list
  *   - Tasks:   localStorage('tasks') or seeded demo tasks
- *   - Budget:  per-client mock data + auto-spend updates on Implemented transactions
+ *   - Budget:  per-client mock data + auto-spend updates on Approved transactions
  *   - Txns:    localStorage('transactions') (rich shape with receipt Data URLs)
  *   - Role:    session/local storage; "re-login" resets org overrides & re-seeds
  *
@@ -27,6 +27,24 @@ export const CATHY_ID = 'mock-cathy';      // Cathy
 
 export const LS_ACTIVE_CLIENT_ID = 'activeClientId';
 export const LS_CURRENT_CLIENT_NAME = 'currentClientName';
+
+// ---------- Budget live update event bus (non-breaking addition) ----------
+const __budgetEventBus = typeof window !== 'undefined' ? new EventTarget() : null;
+
+/** Emit a lightweight budget-changed event (same tab only). */
+function __emitBudgetChanged(detail: any) {
+  try {
+    __budgetEventBus?.dispatchEvent(new CustomEvent('budget:changed', { detail }));
+  } catch {}
+}
+
+/** Subscribe to budget changes (returns unsubscribe) */
+export function subscribeBudgetFE(handler: (detail: any) => void): () => void {
+  const fn = (e: Event) => handler((e as CustomEvent).detail);
+  __budgetEventBus?.addEventListener('budget:changed', fn);
+  return () => __budgetEventBus?.removeEventListener('budget:changed', fn);
+}
+
 
 // ========================= Role (FE) ==============================
 
@@ -456,23 +474,57 @@ export function applyTransactionToBudgetFE(clientId: string, category: string, i
   writeBudgetMap(m);
 }
 
+// ---------- Annual budget total (per client, per year) ----------
+const ANNUAL_BUDGET_LS_KEY = 'annualBudgetByClient'; // { [clientId]: { [year]: number } }
+
+type AnnualBudgetMap = Record<string, Record<string, number>>;
+
+function __readAnnualBudgetMap(): AnnualBudgetMap {
+  try {
+    const raw = localStorage.getItem(ANNUAL_BUDGET_LS_KEY);
+    if (raw) return JSON.parse(raw) as AnnualBudgetMap;
+  } catch {}
+  return {};
+}
+function __writeAnnualBudgetMap(m: AnnualBudgetMap) {
+  try { localStorage.setItem(ANNUAL_BUDGET_LS_KEY, JSON.stringify(m)); } catch {}
+}
+
+/** Read annual TOTAL budget for a client/year (default year = current year) */
+export async function getAnnualBudgetFE(clientId: string, year = String(new Date().getFullYear())): Promise<number> {
+  const m = __readAnnualBudgetMap();
+  return m[clientId]?.[year] ?? 0;
+}
+
+/** Set annual TOTAL budget for a client/year */
+export async function setAnnualBudgetFE(clientId: string, year = String(new Date().getFullYear()), total: number): Promise<void> {
+  const m = __readAnnualBudgetMap();
+  if (!m[clientId]) m[clientId] = {};
+  m[clientId][year] = Math.max(0, Math.floor(total || 0));
+  __writeAnnualBudgetMap(m);
+  __emitBudgetChanged({ clientId, year, kind: 'annual-total' });
+}
+
+
 // ============================== Transactions API (FE) ==============================
 
 export type Transaction = {
   id: string;
   clientId: string;
   type: 'Purchase' | 'Refund' | 'Adjustment';
-  date: string;         // ISO or YYYY-MM-DD
-  madeBy: string;       // e.g., user display name
-  category: string;     // e.g., 'Appointments'
-  item: string;         // e.g., 'Dental Appointments'
-  amount: number;       // positive number (refunds can be negative if desired)
-  // Receipt file saved as Data URL so all roles can open it:
+  date: string;
+  madeBy: string;
+  category: string;
+  item: string;
+  amount: number;
+
   receiptDataUrl?: string;
   receiptMimeType?: string;
+
+
   receiptFilename?: string;
-  // Workflow status (carer uploads -> management confirms):
-  status?: 'Pending' | 'Implemented' | 'Rejected';
+
+  status?: 'Pending' | 'Approved' | 'Rejected';
 };
 
 const TRANSACTIONS_LS_KEY = 'transactions';
@@ -487,7 +539,8 @@ const DEMO_TRANSACTIONS: Transaction[] = [
     category: 'Appointments',
     item: 'Dental Appointments',
     amount: 36,
-    status: 'Implemented',
+    status: 'Approved',
+    receiptFilename: 'Mock receipt 1.pdf',
   },
   {
     id: 't2',
@@ -498,7 +551,8 @@ const DEMO_TRANSACTIONS: Transaction[] = [
     category: 'Hygiene',
     item: 'Toothbrush Heads',
     amount: -2,
-    status: 'Implemented',
+    status: 'Rejected',
+    receiptFilename: 'Mock receipt 2.pdf',
   },
   {
     id: 't3',
@@ -510,24 +564,38 @@ const DEMO_TRANSACTIONS: Transaction[] = [
     item: 'Mouthwash',
     amount: 8.5,
     status: 'Pending',
-  },
-  {
-    id: 't4',
-    clientId: PARTIAL_DASH_ID,
-    type: 'Purchase',
-    date: '2025-09-22',
-    madeBy: 'Family Bob',
-    category: 'Clothing',
-    item: 'Socks',
-    amount: 12,
-    status: 'Implemented',
+    receiptFilename: 'Mock receipt 3.pdf',
   },
 ];
+
+
+function backfillDemoReceipts(all: Transaction[]): Transaction[] {
+  const map: Record<string, string> = {
+    t1: 'Mock receipt 1.pdf',
+    t2: 'Mock receipt 2.pdf',
+    t3: 'Mock receipt 3.pdf',
+  };
+  let changed = false;
+  for (const tx of all) {
+    if (!tx.receiptDataUrl && !tx.receiptFilename && map[tx.id]) {
+      tx.receiptFilename = map[tx.id];
+      tx.receiptMimeType = 'application/pdf';
+      changed = true;
+    }
+  }
+  if (changed) {
+    try { localStorage.setItem(TRANSACTIONS_LS_KEY, JSON.stringify(all)); } catch {}
+  }
+  return all;
+}
 
 function readTransactions(): Transaction[] {
   try {
     const raw = localStorage.getItem(TRANSACTIONS_LS_KEY);
-    if (raw) return JSON.parse(raw) as Transaction[];
+    if (raw) {
+      const parsed = JSON.parse(raw) as Transaction[];
+      return backfillDemoReceipts(parsed); 
+    }
   } catch {}
   try {
     localStorage.setItem(TRANSACTIONS_LS_KEY, JSON.stringify(DEMO_TRANSACTIONS));
@@ -536,9 +604,7 @@ function readTransactions(): Transaction[] {
 }
 
 function writeTransactions(all: Transaction[]) {
-  try {
-    localStorage.setItem(TRANSACTIONS_LS_KEY, JSON.stringify(all));
-  } catch {}
+  try { localStorage.setItem(TRANSACTIONS_LS_KEY, JSON.stringify(all)); } catch {}
 }
 
 export async function getTransactionsFE(clientId: string): Promise<Transaction[]> {
@@ -546,26 +612,24 @@ export async function getTransactionsFE(clientId: string): Promise<Transaction[]
     const all = readTransactions();
     return all.filter((tx) => tx.clientId === clientId);
   }
-
   const res = await fetch(`/api/v1/clients/${clientId}/transactions`, { cache: 'no-store' });
   if (!res.ok) throw new Error(`Failed to fetch transactions (${res.status})`);
   const data = await res.json();
   return Array.isArray(data) ? (data as Transaction[]) : [];
 }
 
-/**
- * Carer (or any role) can create a transaction with a receipt (Data URL).
- * Use this from your UI after reading a File via FileReader.readAsDataURL.
- */
-export async function addTransactionFE(tx: Omit<Transaction, 'id' | 'status'> & { status?: Transaction['status'] }): Promise<string> {
+
+export async function addTransactionFE(
+  tx: Omit<Transaction, 'id' | 'status'> & { status?: Transaction['status'] }
+): Promise<string> {
   if (isMock) {
     const all = readTransactions();
     const withId: Transaction = { ...tx, id: `t${Date.now()}`, status: tx.status ?? 'Pending' };
     all.push(withId);
     writeTransactions(all);
+    __emitBudgetChanged({ clientId: tx.clientId, kind: 'txn-added' });
     return withId.id;
   }
-
   const res = await fetch('/api/transactions', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -576,26 +640,25 @@ export async function addTransactionFE(tx: Omit<Transaction, 'id' | 'status'> & 
   return created?.id ?? '';
 }
 
-/**
- * Management flow: set transaction status.
- * When status becomes 'Implemented', budget.spent is updated accordingly.
- */
-export async function setTransactionStatusFE(txId: string, status: 'Pending' | 'Implemented' | 'Rejected'): Promise<void> {
-  if (!isMock) return; // backend mode would post to API
 
+export async function setTransactionStatusFE(
+  txId: string,
+  status: 'Pending' | 'Approved' | 'Rejected'
+): Promise<void> {
+  if (!isMock) return;
   const all = readTransactions();
   const idx = all.findIndex((t) => t.id === txId);
   if (idx < 0) return;
-
   const prev = all[idx];
   all[idx] = { ...prev, status };
   writeTransactions(all);
 
-  // Apply to budget when implemented
-  if (status === 'Implemented') {
+  if (status === 'Approved') {
     applyTransactionToBudgetFE(prev.clientId, prev.category, prev.item, Number(prev.amount || 0));
+    __emitBudgetChanged({ clientId: prev.clientId, kind: 'txn-approved', txId });
   }
 }
+
 
 // ============================ Users & Access (FE) ============================
 
@@ -636,4 +699,165 @@ export async function getUsersWithAccessFE(clientId: string): Promise<AccessUser
   if (!res.ok) return [];
   const data = await res.json();
   return Array.isArray(data) ? (data as AccessUser[]) : [];
+}
+
+// ============================== Request Log (FE) ==============================
+
+export type RequestLogFE = {
+  id: string;
+  clientId: string;
+  createdAt: string;          // ISO string
+  createdBy: string;          // display name
+  title: string;              // short summary
+  detail: string;            // long text
+  reason: string;            // long text
+  status: 'Pending' | 'Approved' | 'Rejected';
+  relatedTaskId?: string;     // link to a task if any
+  category?: string;          // optional grouping
+  priority?: 'Low' | 'Medium' | 'High';
+};
+
+const REQUESTS_LS_KEY = 'requests';
+
+const DEMO_REQUESTS: RequestLogFE[] = [
+  {
+    id: 'rq1',
+    clientId: FULL_DASH_ID,
+    createdAt: '2025-09-25T09:20:00Z',
+    createdBy: 'Family Alice',
+    title: 'Adjust dental appointment frequency',
+    detail: 'Dentist suggested every 2 months.',
+    reason: 'Better oral health management.',
+    status: 'Pending',
+    category: 'Appointments',
+    priority: 'Medium',
+  },
+  {
+    id: 'rq2',
+    clientId: FULL_DASH_ID,
+    createdAt: '2025-09-27T14:10:00Z',
+    createdBy: 'Carer John',
+    title: 'Change toothbrush brand',
+    detail: 'Prefer softer bristles.',
+    reason: 'Client comfort and preference.',
+    status: 'Approved',
+    category: 'Hygiene',
+    priority: 'Low',
+  },
+  {
+    id: 'rq3',
+    clientId: PARTIAL_DASH_ID,
+    createdAt: '2025-09-29T08:00:00Z',
+    createdBy: 'Bob Smith Jr.',
+    title: 'Add weekly walking activity',
+    detail: '30 minutes at the park.',
+    reason: 'Promote physical activity.',
+    status: 'Rejected',
+    category: 'Activities',
+    priority: 'Low',
+  },
+];
+
+function readRequestsAll(): RequestLogFE[] {
+  try {
+    const raw = localStorage.getItem(REQUESTS_LS_KEY);
+    if (raw) return JSON.parse(raw) as RequestLogFE[];
+  } catch {}
+  try {
+    localStorage.setItem(REQUESTS_LS_KEY, JSON.stringify(DEMO_REQUESTS));
+  } catch {}
+  return DEMO_REQUESTS;
+}
+
+function writeRequestsAll(all: RequestLogFE[]) {
+  try { localStorage.setItem(REQUESTS_LS_KEY, JSON.stringify(all)); } catch {}
+}
+
+
+export async function getRequestsByClientFE(clientId: string): Promise<RequestLogFE[]> {
+  if (!isMock) {
+    
+    return [];
+  }
+  const all = readRequestsAll();
+
+  return all.filter(r => r.clientId === clientId)
+            .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+}
+
+
+export async function addRequestFE(req: Omit<RequestLogFE, 'id' | 'createdAt' | 'status'> & {
+  status?: RequestLogFE['status'];
+  createdAt?: string;
+}): Promise<string> {
+  const all = readRequestsAll();
+  const id = `rq${Date.now()}`;
+  const withId: RequestLogFE = {
+    id,
+    status: req.status ?? 'Pending',
+    createdAt: req.createdAt ?? new Date().toISOString(),
+    ...req,
+  };
+  all.push(withId);
+  writeRequestsAll(all);
+  return id;
+}
+
+export async function setRequestStatusFE(id: string, status: RequestLogFE['status']): Promise<void> {
+  const all = readRequestsAll();
+  const idx = all.findIndex(r => r.id === id);
+  if (idx >= 0) {
+    all[idx] = { ...all[idx], status };
+    writeRequestsAll(all);
+  }
+}
+
+
+// ============================== Task Catalog (FE) ==============================
+
+export type TaskCatalogItemFE = {
+  id: string;
+  title: string;
+  category: string;
+  defaultFrequency?: string;
+  description?: string;
+};
+
+const TASK_CATALOG_LS_KEY = 'taskCatalog';
+
+const DEMO_TASK_CATALOG: TaskCatalogItemFE[] = [
+  { id: 'tc-apt-dental',   title: 'Dental Appointment',        category: 'Appointments', defaultFrequency: 'Monthly',   description: 'Routine dental check' },
+  { id: 'tc-apt-gp',       title: 'GP Checkup',                category: 'Appointments', defaultFrequency: 'Quarterly'  },
+  { id: 'tc-hyg-tooth',    title: 'Replace Toothbrush Head',   category: 'Hygiene',      defaultFrequency: 'Every 3 months' },
+  { id: 'tc-hyg-shampoo',  title: 'Buy Shampoo',               category: 'Hygiene' },
+  { id: 'tc-cloth-socks',  title: 'Buy Socks',                 category: 'Clothing' },
+];
+
+function readTaskCatalogAll(): TaskCatalogItemFE[] {
+  try {
+    const raw = localStorage.getItem(TASK_CATALOG_LS_KEY);
+    if (raw) return JSON.parse(raw) as TaskCatalogItemFE[];
+  } catch {}
+  try {
+    localStorage.setItem(TASK_CATALOG_LS_KEY, JSON.stringify(DEMO_TASK_CATALOG));
+  } catch {}
+  return DEMO_TASK_CATALOG;
+}
+
+export async function getTaskCatalogFE(): Promise<TaskCatalogItemFE[]> {
+  if (!isMock) {
+
+    return [];
+  }
+  return readTaskCatalogAll();
+}
+
+
+// ============================== Receipt helper ===============================
+
+
+export function getReceiptHrefFE(tx: Transaction): string {
+  if (tx.receiptDataUrl) return tx.receiptDataUrl;
+  if (tx.receiptFilename) return `/receipts/${encodeURIComponent(tx.receiptFilename)}`;
+  return '';
 }

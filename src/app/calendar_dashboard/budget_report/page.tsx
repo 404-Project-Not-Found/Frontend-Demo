@@ -1,17 +1,17 @@
 /**
- * Budget Report
- * Frontend Authors: Vanessa Teo & Qingyue Zhao
+ * File path: app/calendar_dashboard/budget_report/page.tsx
+ * Frontend Authors: Vanessa Teo & Qingyue Zhao (revised)
  *
- * - Underlines "Budget Report" in the top menu via page="budget".
- * - Pink banner title becomes "<Client>'s Budget" automatically.
- * - Management-only "Edit" to change Annual Budget and recalc Remaining.
- * - Layout: full-bleed (no inner white panel), header + content fill viewport.
- * - Fetches rows via getBudgetRowsFE(activeClientId).
+ * What’s new in this version:
+ * - Fix: clients prop now maps {_id -> id, name, orgAccess} so DashboardChrome 
+ * - Persisted Annual Budget override to localStorage by (clientId + year) so ALL roles see the same value.
+ * - When switching client/year， the override input box updates to show the correct value.
  */
 
 'use client';
 
 import React, { Suspense, useEffect, useMemo, useState } from 'react';
+
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 
@@ -29,8 +29,8 @@ import {
 } from '@/lib/mock/mockApi';
 
 /* ---------------------------------- Types ---------------------------------- */
-type Client = { id: string; name: string };
 type Role = 'carer' | 'family' | 'management';
+type ClientLite = { id: string; name: string; orgAccess?: 'approved' | 'pending' | 'revoked' };
 
 /* ------------------------------- Chrome colors ------------------------------- */
 const colors = {
@@ -47,14 +47,36 @@ const getStatus = (remaining: number): { tone: Tone; label: string } => {
   return { tone: 'green', label: 'Within Limit' };
 };
 
-/* --------------------------------- Page ---------------------------------- */
+/** ---------- Annual override persistence (shared across roles) ---------- */
+const ANNUAL_OVERRIDE_KEY = 'annualBudgetOverrideByClientYear';
+// shape: { [clientId]: { [year]: number } }
+function readAnnualOverrides(): Record<string, Record<string, number>> {
+  try {
+    const raw = localStorage.getItem(ANNUAL_OVERRIDE_KEY);
+    if (raw) return JSON.parse(raw);
+  } catch {}
+  return {};
+}
+function writeAnnualOverrides(m: Record<string, Record<string, number>>) {
+  try {
+    localStorage.setItem(ANNUAL_OVERRIDE_KEY, JSON.stringify(m));
+  } catch {}
+}
+function getAnnualOverride(clientId: string, year: string): number | null {
+  const m = readAnnualOverrides();
+  const v = m[clientId]?.[year];
+  return typeof v === 'number' && Number.isFinite(v) ? v : null;
+}
+function setAnnualOverride(clientId: string, year: string, value: number) {
+  const m = readAnnualOverrides();
+  m[clientId] = m[clientId] || {};
+  m[clientId][year] = value;
+  writeAnnualOverrides(m);
+}
+
 export default function BudgetReportPage() {
   return (
-    <Suspense
-      fallback={
-        <div className="p-6 text-gray-600">Loading budget report...</div>
-      }
-    >
+    <Suspense fallback={<div className="p-6 text-gray-600">Loading budget report...</div>}>
       <BudgetReportInner />
     </Suspense>
   );
@@ -71,7 +93,7 @@ function BudgetReportInner() {
   const isManagement = role === 'management';
 
   // ===== Clients =====
-  const [clients, setClients] = useState<Client[]>([]);
+  const [clients, setClients] = useState<ClientLite[]>([]);
   const [activeClientId, setActiveClientId] = useState<string | null>(null);
   const [displayName, setDisplayName] = useState<string>('');
 
@@ -80,19 +102,22 @@ function BudgetReportInner() {
 
   // ===== Editing state =====
   const [isEditing, setIsEditing] = useState(false);
-  const [annualBudgetOverride, setAnnualBudgetOverride] = useState<
-    number | null
-  >(null);
+  const [annualBudgetOverride, setAnnualBudgetOverride] = useState<number | null>(null);
   const [annualBudgetInput, setAnnualBudgetInput] = useState<string>('');
 
-  /** Load clients */
+  // ===== Local UI state =====
+  const [q, setQ] = useState('');
+  const [year, setYear] = useState('2025');
+
+  /** Load clients & set active client */
   useEffect(() => {
     (async () => {
       try {
-        const list = await getClientsFE();
-        const mapped: Client[] = list.map((c: ApiClient) => ({
+        const list = await getClientsFE(); // ApiClient[]
+        const mapped: ClientLite[] = list.map((c: ApiClient) => ({
           id: c._id,
           name: c.name,
+          orgAccess: c.orgAccess,
         }));
         setClients(mapped);
 
@@ -100,6 +125,12 @@ function BudgetReportInner() {
         if (id) {
           setActiveClientId(id);
           setDisplayName(name || mapped.find((m) => m.id === id)?.name || '');
+        } else if (mapped.length) {
+          // fall back to first client if nothing is selected
+          const first = mapped[0];
+          setActiveClientId(first.id);
+          setDisplayName(first.name);
+          writeActiveClientToStorage(first.id, first.name);
         }
       } catch {
         setClients([]);
@@ -107,10 +138,11 @@ function BudgetReportInner() {
     })();
   }, []);
 
-  /** Load budget rows when active client changes */
+  /** Load budget rows + annual override when active client or year changes */
   useEffect(() => {
     if (!activeClientId) {
       setRows([]);
+      setAnnualBudgetOverride(null);
       return;
     }
     (async () => {
@@ -120,8 +152,11 @@ function BudgetReportInner() {
       } catch {
         setRows([]);
       }
+      // read persisted override
+      const override = getAnnualOverride(activeClientId, year);
+      setAnnualBudgetOverride(override);
     })();
-  }, [activeClientId]);
+  }, [activeClientId, year]);
 
   /** Handle client change in banner */
   const onClientChange = (id: string) => {
@@ -136,6 +171,9 @@ function BudgetReportInner() {
     setActiveClientId(id);
     setDisplayName(name);
     writeActiveClientToStorage(id, name);
+    // when client changes, load its override for current year
+    const override = getAnnualOverride(id, year);
+    setAnnualBudgetOverride(override);
   };
 
   const onLogoClick = () => {
@@ -143,11 +181,7 @@ function BudgetReportInner() {
     router.push('/empty_dashboard');
   };
 
-  // ===== Local UI state =====
-  const [q, setQ] = useState('');
-  const [year, setYear] = useState('2025');
-
-  /** Filter by search */
+  /** Search filter */
   const filtered = useMemo(() => {
     const t = q.trim().toLowerCase();
     if (!t) return rows;
@@ -157,7 +191,7 @@ function BudgetReportInner() {
     );
   }, [q, rows]);
 
-  /** Totals */
+  /** Totals from rows */
   const totals = useMemo(() => {
     const allocated = filtered.reduce((s, r) => s + r.allocated, 0);
     const spent = filtered.reduce((s, r) => s + r.spent, 0);
@@ -171,7 +205,7 @@ function BudgetReportInner() {
   return (
     <DashboardChrome
       page="budget"
-      clients={clients}
+      clients={clients}                
       onClientChange={onClientChange}
       colors={colors}
       onLogoClick={onLogoClick}
@@ -181,13 +215,9 @@ function BudgetReportInner() {
         <div className="w-full bg-[#3A0000] px-6 py-4 flex items-center justify-between">
           {/* LEFT: title + year */}
           <div className="flex items-center gap-10">
-            <h2 className="text-white text-2xl font-semibold">
-              Annual Budget{' '}
-            </h2>
+            <h2 className="text-white text-2xl font-semibold">Annual Budget</h2>
             <div className="flex items-center gap-2">
-              <span className="font-semibold text-white text-lg">
-                Select year:
-              </span>
+              <span className="font-semibold text-white text-lg">Select year:</span>
               <select
                 value={year}
                 onChange={(e) => setYear(e.target.value)}
@@ -208,14 +238,12 @@ function BudgetReportInner() {
               placeholder="Search"
               className="h-9 rounded-full bg-white text-black px-4 border"
             />
-            {isManagement &&
+            {role === 'management' &&
               (!isEditing ? (
                 <button
                   onClick={() => {
                     setIsEditing(true);
-                    setAnnualBudgetInput(
-                      String(annualBudgetOverride ?? totals.allocated)
-                    );
+                    setAnnualBudgetInput(String(annualBudgetOverride ?? totals.allocated));
                   }}
                   className="px-3 py-1 rounded-md bg-white text-black font-semibold hover:bg-black/10"
                 >
@@ -226,8 +254,9 @@ function BudgetReportInner() {
                   <button
                     onClick={() => {
                       const val = parseFloat(annualBudgetInput);
-                      if (!Number.isFinite(val) || val < 0) return;
+                      if (!Number.isFinite(val) || val < 0 || !activeClientId) return;
                       setAnnualBudgetOverride(val);
+                      setAnnualOverride(activeClientId, year, val); 
                       setIsEditing(false);
                     }}
                     className="px-3 py-1 rounded-md bg-white text-black font-semibold hover:bg-black/10"
@@ -253,7 +282,7 @@ function BudgetReportInner() {
           {/* Tiles */}
           <div className="grid grid-cols-1 md:grid-cols-3 gap-18 mb-10 text-center">
             <div className="rounded-2xl border px-6 py-8 bg-[#F8CBA6]">
-              {isManagement && isEditing ? (
+              {role === 'management' && isEditing ? (
                 <>
                   <input
                     type="number"
@@ -267,25 +296,19 @@ function BudgetReportInner() {
                 </>
               ) : (
                 <>
-                  <div className="text-2xl font-bold">
-                    ${effectiveAllocated.toLocaleString()}
-                  </div>
+                  <div className="text-2xl font-bold">${effectiveAllocated.toLocaleString()}</div>
                   <div className="text-sm">Annual Budget</div>
                 </>
               )}
             </div>
 
             <div className="rounded-2xl border px-6 py-8 bg-white">
-              <div className="text-2xl font-bold">
-                ${totals.spent.toLocaleString()}
-              </div>
+              <div className="text-2xl font-bold">${totals.spent.toLocaleString()}</div>
               <div className="text-sm">Spent to Date</div>
             </div>
 
             <div className="rounded-2xl border px-6 py-8 bg-white">
-              <div
-                className={`text-2xl font-bold ${effectiveRemaining < 0 ? 'text-red-600' : 'text-green-600'}`}
-              >
+              <div className={`text-2xl font-bold ${effectiveRemaining < 0 ? 'text-red-600' : 'text-green-600'}`}>
                 {effectiveRemaining < 0
                   ? `-$${Math.abs(effectiveRemaining).toLocaleString()}`
                   : `$${effectiveRemaining.toLocaleString()}`}
@@ -311,10 +334,7 @@ function BudgetReportInner() {
                   const remaining = r.allocated - r.spent;
                   const status = getStatus(remaining);
                   return (
-                    <tr
-                      key={i}
-                      className="border-b last:border-b border-[#3A0000]/20"
-                    >
+                    <tr key={i} className="border-b last:border-b border-[#3A0000]/20">
                       <td className="px-4 py-5">
                         <Link
                           href={`/calendar_dashboard/budget_report/category-cost/${encodeURIComponent(
@@ -327,12 +347,8 @@ function BudgetReportInner() {
                       </td>
                       <td className="px-4 py-5">${r.allocated}</td>
                       <td className="px-4 py-5">${r.spent}</td>
-                      <td
-                        className={`px-4 py-5 ${remaining < 0 ? 'text-red-600' : ''}`}
-                      >
-                        {remaining < 0
-                          ? `-$${Math.abs(remaining)}`
-                          : `$${remaining}`}
+                      <td className={`px-4 py-5 ${remaining < 0 ? 'text-red-600' : ''}`}>
+                        {remaining < 0 ? `-$${Math.abs(remaining)}` : `$${remaining}`}
                       </td>
                       <td className="px-4 py-5">
                         <Badge tone={status.tone}>{status.label}</Badge>

@@ -194,8 +194,6 @@ export default function AddTaskPage() {
     <DashboardChrome
       page="care-add"
       clients={clients}
-      activeClientId={activeId}
-      activeClientName={activeName}
       onClientChange={onClientChange}
       colors={chromeColors}
       onLogoClick={onLogoClick}

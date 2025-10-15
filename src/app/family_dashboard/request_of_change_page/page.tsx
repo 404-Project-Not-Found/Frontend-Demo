@@ -1,12 +1,15 @@
 /**
  * File path: /app/request_form/page.tsx
- * Frontend Author: Devni Wijesinghe
- * Last Update by Qingyue Zhao: 2025-10-03
+ * Frontend Author: Devni Wijesinghe (refactor by QZ)
+ * Last Update: 2025-10-15
  *
- * Description:
- * - Family-facing "Request of Change" form, built on top of shared <DashboardChrome />.
- * - Full-bleed layout; section header → notice → form → footer buttons.
- * - Validates required fields (task name, details, reason) before submit.
+ * Description (EN):
+ * - Family-facing "Request of Change" form using the *new* unified FE API layer.
+ * - Shares the same three demo clients across the whole app (no per-page divergence).
+ * - On submit, we persist a RequestLog entry via addRequestFE() and navigate to Request Log.
+ * - Category/task dropdowns are driven by the *flat* task catalog (getTaskCatalogFE).
+ * - Client switching uses the same pattern as transactions/budget pages:
+ *   readActiveClientFromStorage() for initial, writeActiveClientToStorage() on change.
  */
 
 'use client';
@@ -16,16 +19,22 @@ export const dynamic = 'force-dynamic';
 import React, { useEffect, useMemo, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import DashboardChrome from '@/components/top_menu/client_schedule';
+
 import {
+  getViewerRoleFE,
   getClientsFE,
   readActiveClientFromStorage,
   writeActiveClientToStorage,
   FULL_DASH_ID,
   NAME_BY_ID,
   type Client as ApiClient,
-  getTasksFE,
+
+  // NEW unified APIs
+  getTaskCatalogFE,          // flat array: { id, title, category, ... }
+  getTasksFE,                // current per-client tasks (calendar uses the same)
+  addRequestFE,              // persist a new request log item
   type Task as ApiTask,
-  getTaskCatalogFE,
+  type TaskCatalogItemFE,
 } from '@/lib/mock/mockApi';
 
 /* UI colors to match chrome */
@@ -54,7 +63,7 @@ type Client = { id: string; name: string };
 export default function RequestChangeFormPage() {
   const router = useRouter();
 
-  /* ---------- Top bar client dropdown ---------- */
+  /* ---------- Top bar client dropdown (shared pattern) ---------- */
   const [clients, setClients] = useState<Client[]>([]);
   const [{ id: activeId, name: activeName }, setActive] = useState<{
     id: string | null;
@@ -74,7 +83,6 @@ export default function RequestChangeFormPage() {
         const stored = readActiveClientFromStorage();
         const resolvedId = stored.id || FULL_DASH_ID;
         const resolvedName = stored.name || NAME_BY_ID[resolvedId] || '';
-        // IMPORTANT: use resolvedId here
         setActive({ id: resolvedId, name: resolvedName });
       } catch {
         setClients([]);
@@ -83,38 +91,40 @@ export default function RequestChangeFormPage() {
   }, []);
 
   const onClientChange = (id: string) => {
-    if (!id) {
-      setActive({ id: null, name: '' });
-      writeActiveClientToStorage('', '');
-      return;
-    }
     const c = clients.find((x) => x.id === id);
     const name = c?.name || '';
-    setActive({ id, name });
-    writeActiveClientToStorage(id, name);
+    setActive({ id: id || null, name });
+    writeActiveClientToStorage(id || '', name);
   };
 
-  const onLogoClick = () => router.push('/empty_dashboard');
-
   /* ---------- Form state ---------- */
-  const [allTasks, setAllTasks] = useState<ApiTask[]>([]);
-  const [taskName, setTaskName] = useState(''); // Care Item Sub Category
+  const role = getViewerRoleFE();
   const [category, setCategory] = useState(''); // Care Item Category
+  const [taskName, setTaskName] = useState(''); // Care Item Sub Category
   const [details, setDetails] = useState('');
   const [reason, setReason] = useState('');
   const [submitMessage, setSubmitMessage] = useState('');
 
-  // Catalog & helpers
-  const catalog = useMemo(() => getTaskCatalogFE(), []);
-  const labelToCategory = useMemo(() => {
-    const m = new Map<string, string>();
-    catalog.forEach((c) => c.tasks.forEach((t) => m.set(t.label, c.category)));
-    return m;
-  }, [catalog]);
+  // Catalog: flat list → derive categories and category→tasks
+  const [catalog, setCatalog] = useState<TaskCatalogItemFE[]>([]);
+  useEffect(() => {
+    (async () => {
+      try {
+        const data = await getTaskCatalogFE();
+        setCatalog(data || []);
+      } catch {
+        setCatalog([]);
+      }
+    })();
+  }, []);
 
-  const norm = (s?: string) => (s || '').trim().toLowerCase();
+  const categoryOptions = useMemo(
+    () => Array.from(new Set(catalog.map((i) => i.category))).sort(),
+    [catalog]
+  );
 
-  // Load tasks (with migration handled in mockApi if needed)
+  // All tasks (for current client). We only use this to *prefer* existing tasks.
+  const [allTasks, setAllTasks] = useState<ApiTask[]>([]);
   useEffect(() => {
     (async () => {
       try {
@@ -126,43 +136,72 @@ export default function RequestChangeFormPage() {
     })();
   }, []);
 
-  // Compute tasks by current client
+  // Client-specific tasks
   const tasksForClient = useMemo(() => {
     if (!activeId) return [];
     return (allTasks || []).filter((t: ApiTask) => t.clientId === activeId);
   }, [allTasks, activeId]);
 
-  // Category-filtered tasks (fallback to catalog mapping if task.category is missing)
-  const tasksForClientAndCategory = useMemo(() => {
-    if (!category) return [];
-    const target = norm(category);
-    return tasksForClient.filter((t: ApiTask) => {
-      const cat = t.category || labelToCategory.get(t.title) || '';
-      return norm(cat) === target;
-    });
-  }, [tasksForClient, category, labelToCategory]);
+  // Category-filtered catalog
+  const catalogByCategory = useMemo(() => {
+    const map = new Map<string, TaskCatalogItemFE[]>();
+    for (const row of catalog) {
+      const arr = map.get(row.category) || [];
+      arr.push(row);
+      map.set(row.category, arr);
+    }
+    return map;
+  }, [catalog]);
 
-  // When a task is selected, also backfill category if empty (defensive)
+  // Options for the sub-category:
+  // Prefer tasks that the client already has in this category; if none, fall back to catalog items of this category.
+  const subcategoryOptions = useMemo(() => {
+    if (!category) return [];
+    const existing = tasksForClient
+      .filter((t) => (t.category || '').toLowerCase() === category.toLowerCase())
+      .map((t) => t.title);
+
+    if (existing.length > 0) {
+      return Array.from(new Set(existing)).sort();
+    }
+    const fromCatalog = (catalogByCategory.get(category) || []).map((i) => i.title);
+    return Array.from(new Set(fromCatalog)).sort();
+  }, [tasksForClient, category, catalogByCategory]);
+
   const onTaskChange = (value: string) => {
     setTaskName(value);
     setSubmitMessage('');
-    if (!category) {
-      const auto = labelToCategory.get(value) || '';
-      setCategory(auto);
-    }
   };
 
-  const handleSubmit = () => {
-    if (
-      !taskName.trim() ||
-      !category.trim() ||
-      !details.trim() ||
-      !reason.trim()
-    ) {
+  const createdByFromRole = (r: string) =>
+    r === 'family' ? 'Family User'
+      : r === 'carer' ? 'Carer User'
+      : 'Management User';
+
+  const handleSubmit = async () => {
+    if (!activeId) {
+      setSubmitMessage('Please select a client.');
+      return;
+    }
+    if (!taskName.trim() || !category.trim() || !details.trim() || !reason.trim()) {
       setSubmitMessage('Please fill in all fields before submitting.');
       return;
     }
-    router.push('/calendar_dashboard');
+
+    try {
+      await addRequestFE({
+        clientId: activeId,
+        createdBy: createdByFromRole(role),
+        title: `${taskName} – Change Request`,
+        detail: details,        
+        reason: reason,  
+        category,
+        priority: 'Medium',
+      });
+      router.push('/request-log-page'); // go see the newly added record
+    } catch {
+      setSubmitMessage('Failed to submit. Please try again.');
+    }
   };
 
   const handleCancel = () => {
@@ -178,10 +217,8 @@ export default function RequestChangeFormPage() {
     <DashboardChrome
       page="request-form"
       colors={chromeColors}
-      onLogoClick={onLogoClick}
+      onLogoClick={() => router.push('/empty_dashboard')}
       clients={clients}
-      activeClientId={activeId}
-      activeClientName={activeName}
       onClientChange={onClientChange}
     >
       {/* Fill entire area below the top bar */}
@@ -202,9 +239,8 @@ export default function RequestChangeFormPage() {
         {/* Notice banner */}
         <div className="px-6 py-4" style={{ backgroundColor: palette.notice }}>
           <h3 className="text-base md:text-lg px-5 text-black">
-            <strong>Notice:</strong> Please describe what you’d like to change
-            about the care item. Management will review your request and respond
-            accordingly.
+            <strong>Notice:</strong> Describe what you’d like to change for this care item.
+            Management will review and respond accordingly.
           </h3>
         </div>
 
@@ -217,22 +253,22 @@ export default function RequestChangeFormPage() {
                 value={category}
                 onChange={(e) => {
                   setCategory(e.target.value);
-                  setTaskName(''); // reset task when category changes
+                  setTaskName('');
                   setSubmitMessage('');
                 }}
                 className="w-full rounded-lg bg-white border px-3 py-2 outline-none focus:ring-4 text-black"
                 style={{ borderColor: `${palette.inputBorder}66` }}
               >
                 <option value="">Select a category</option>
-                {catalog.map((c) => (
-                  <option key={c.category} value={c.category}>
-                    {c.category}
+                {categoryOptions.map((c) => (
+                  <option key={c} value={c}>
+                    {c}
                   </option>
                 ))}
               </select>
             </Field>
 
-            {/* Care Item Sub Category (depends on category + client) */}
+            {/* Care Item Sub Category */}
             <Field label="Care Item Sub Category">
               <select
                 value={taskName}
@@ -245,14 +281,14 @@ export default function RequestChangeFormPage() {
                   <option value="">Select a client first</option>
                 ) : !category ? (
                   <option value="">Select a category first</option>
-                ) : tasksForClientAndCategory.length === 0 ? (
+                ) : subcategoryOptions.length === 0 ? (
                   <option value="">No tasks available</option>
                 ) : (
                   <>
                     <option value="">Select a task…</option>
-                    {tasksForClientAndCategory.map((t: ApiTask) => (
-                      <option key={t.id} value={t.title}>
-                        {t.title}
+                    {subcategoryOptions.map((title) => (
+                      <option key={title} value={title}>
+                        {title}
                       </option>
                     ))}
                   </>
@@ -304,7 +340,7 @@ export default function RequestChangeFormPage() {
               </button>
             </div>
 
-            {/* Validation message */}
+            {/* Validation / error message */}
             {submitMessage && (
               <div className="font-semibold text-red-600">{submitMessage}</div>
             )}
@@ -323,9 +359,7 @@ export default function RequestChangeFormPage() {
             ?
           </button>
           <div className="absolute bottom-12 right-0 hidden w-64 max-w-[90vw] rounded bg-white border p-2 text-sm text-black group-hover:block shadow-lg">
-            Fill in the task and category, describe the change, and provide a
-            reason. Click <b>Submit</b> to send, or <b>Cancel</b> to return to
-            the menu.
+            Fill category & task, describe the change and reason, then <b>Submit</b>.
           </div>
         </div>
       </div>

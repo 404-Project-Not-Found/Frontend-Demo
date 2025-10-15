@@ -72,7 +72,6 @@ type ChromeProps = {
   navItems?: { label: string; href: string }[];
   headerTitle?: string;
   bannerTitle?: string;
-
   /**
    * Force showing the client picker. (Now shown for ALL roles by default.)
    */

@@ -1,16 +1,13 @@
 /**
- * File path: /app/management_dashboard/manage_care_item/edit/page.tsx
- * Frontend Author: Qingyue Zhao
- * Last Update: 2025-10-02
+ * File path: /app/management_dashboard/manage_care_item/add/page.tsx
+ * Frontend Author: Qingyue Zhao (updated to *new* FE API)
+ * Last Update: 2025-10-15
  *
- * Description:
- * - This page provides the "Edit Care Item" form for management users.
- * - Built on top of the shared <DashboardChrome /> component to ensure consistent
- *   layout and navigation across the application.
- * - Allows selecting the active client, and creating a new care task with details:
- *   category, name, date range, repeat interval, status, etc.
- * - Tasks are stored in localStorage (mock mode) and persisted across reloads.
- * - Buttons at the bottom support Cancel (navigate back) and Add (save task).
+ * Description (EN):
+ * - "Add New Care Item" using the unified FE layer (getTasksFE/saveTasksFE/getTaskCatalogFE).
+ * - Client selection follows the same pattern as other pages (shared 3 clients).
+ * - Catalog is *flat*; we build Category -> Task titles from it for dropdowns.
+ * - Saved tasks use the *calendar-compatible* Task shape from mockApi.ts.
  */
 
 'use client';
@@ -18,62 +15,24 @@
 import { useRouter } from 'next/navigation';
 import { useState, useEffect, useMemo } from 'react';
 import DashboardChrome from '@/components/top_menu/client_schedule';
+
 import {
+  getClientsFE,
   readActiveClientFromStorage,
   writeActiveClientToStorage,
-  getClientsFE,
   FULL_DASH_ID,
   NAME_BY_ID,
-  getTaskCatalogFE, // keep dropdown logic
   type Client as ApiClient,
+
+  // NEW task APIs (calendar-compatible)
+  getTasksFE,
+  saveTasksFE,
+  getTaskCatalogFE,
+  type Task as CalendarTask,
+  type TaskCatalogItemFE,
 } from '@/lib/mock/mockApi';
 
-type Unit = 'day' | 'week' | 'month' | 'year';
-
-type Task = {
-  label: string;
-  slug: string;
-  status: string;
-  category: string;
-  clientName?: string;
-  deleted?: boolean;
-  frequency?: string;
-  lastDone?: string;
-  frequencyDays?: number;
-  frequencyCount?: number;
-  frequencyUnit?: Unit;
-  dateFrom?: string;
-  dateTo?: string;
-};
-
-function saveTasks(tasks: Task[]) {
-  if (typeof window === 'undefined') return;
-  localStorage.setItem('tasks', JSON.stringify(tasks));
-}
-function loadTasks(): Task[] {
-  if (typeof window === 'undefined') return [];
-  try {
-    return JSON.parse(localStorage.getItem('tasks') || '[]') as Task[];
-  } catch {
-    return [];
-  }
-}
-
-const unitToDays: Record<Unit, number> = {
-  day: 1,
-  week: 7,
-  month: 30,
-  year: 365,
-};
-const toDays = (count: number, unit: Unit) =>
-  Math.max(1, Math.floor(count || 1)) * unitToDays[unit];
-const slugify = (s: string) =>
-  s
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9\s-]/g, '')
-    .replace(/\s+/g, '-')
-    .replace(/-+/g, '-');
+type Client = { id: string; name: string };
 
 const chromeColors = {
   header: '#3A0000',
@@ -82,17 +41,21 @@ const chromeColors = {
   pageBg: '#FAEBDC',
 };
 
-type Client = { id: string; name: string };
+type Unit = 'day' | 'week' | 'month' | 'year';
+const unitToDays: Record<Unit, number> = { day: 1, week: 7, month: 30, year: 365 };
+const addDays = (iso: string, days: number) => {
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return iso;
+  d.setDate(d.getDate() + days);
+  return d.toISOString().slice(0, 10); // YYYY-MM-DD
+};
 
 export default function AddTaskPage() {
   const router = useRouter();
 
-  // Topbar client list
+  // Topbar client list (shared three clients)
   const [clients, setClients] = useState<Client[]>([]);
-  const [{ id: activeId, name: activeName }, setActive] = useState<{
-    id: string | null;
-    name: string;
-  }>({
+  const [{ id: activeId, name: activeName }, setActive] = useState<{ id: string | null; name: string }>({
     id: null,
     name: '',
   });
@@ -101,16 +64,13 @@ export default function AddTaskPage() {
     (async () => {
       try {
         const list = await getClientsFE();
-        const mapped: Client[] = list.map((c: ApiClient) => ({
-          id: c._id,
-          name: c.name,
-        }));
+        const mapped: Client[] = list.map((c: ApiClient) => ({ id: c._id, name: c.name }));
         setClients(mapped);
 
         const stored = readActiveClientFromStorage();
         const resolvedId = stored.id || FULL_DASH_ID;
         const resolvedName = stored.name || NAME_BY_ID[resolvedId] || '';
-        setActive({ id: stored.id || null, name: resolvedName });
+        setActive({ id: resolvedId, name: resolvedName });
       } catch {
         setClients([]);
       }
@@ -118,187 +78,154 @@ export default function AddTaskPage() {
   }, []);
 
   const onClientChange = (id: string) => {
-    if (!id) {
-      setActive({ id: null, name: '' });
-      writeActiveClientToStorage('', '');
-      return;
-    }
     const c = clients.find((x) => x.id === id);
     const name = c?.name || '';
-    setActive({ id, name });
-    writeActiveClientToStorage(id, name);
+    setActive({ id: id || null, name });
+    writeActiveClientToStorage(id || '', name);
   };
 
-  // Form states
-  const [label, setLabel] = useState('');
-  const [status, setStatus] = useState('in progress');
-  const [category, setCategory] = useState('');
-  const [dateFrom, setDateFrom] = useState('');
-  const [dateTo, setDateTo] = useState('');
-  const [notes, setNotes] = useState('');
+  // Catalog (flat) -> categories & titles
+  const [catalog, setCatalog] = useState<TaskCatalogItemFE[]>([]);
+  useEffect(() => {
+    (async () => {
+      try {
+        const data = await getTaskCatalogFE();
+        setCatalog(data || []);
+      } catch {
+        setCatalog([]);
+      }
+    })();
+  }, []);
 
-  const [frequencyCountStr, setFrequencyCountStr] = useState<string>('');
-  const [frequencyUnit, setFrequencyUnit] = useState<Unit>('day');
-
-  const statusOptions = useMemo(
-    () => ['in progress', 'Completed', 'Not started', 'Paused', 'Cancelled'],
-    []
+  const categories = useMemo(
+    () => Array.from(new Set(catalog.map((i) => i.category))).sort(),
+    [catalog]
   );
+  const titlesByCategory = useMemo(() => {
+    const m = new Map<string, string[]>();
+    for (const i of catalog) {
+      const arr = m.get(i.category) || [];
+      arr.push(i.title);
+      m.set(i.category, arr);
+    }
+    for (const [k, arr] of m) m.set(k, Array.from(new Set(arr)).sort());
+    return m;
+  }, [catalog]);
 
-  const palette = {
-    danger: '#8B0000',
-    dangerHover: '#a40f0f',
-  };
+  // Form states (simple)
+  const [category, setCategory] = useState('');
+  const [title, setTitle] = useState('');
+  const [frequencyCount, setFrequencyCount] = useState<string>(''); // numeric string
+  const [frequencyUnit, setFrequencyUnit] = useState<Unit>('month');
+  const [dateFrom, setDateFrom] = useState<string>(''); // YYYY-MM-DD
 
-  // ---- keep dropdown logic: Category → Task name ----
-  const catalog = useMemo(() => getTaskCatalogFE(), []);
-  const tasksInCategory = useMemo(() => {
-    const entry = catalog.find((c) => c.category === category);
-    return entry ? entry.tasks : [];
-  }, [catalog, category]);
-
-  const onDelete = () => {
-    if (!confirm('Discard this new task and go back?')) return;
-    router.back();
-  };
-
-  const onCreate = () => {
-    const name = label.trim();
-    if (!name) {
-      alert('Please enter the task name.');
+  const onCreate = async () => {
+    if (!activeId) {
+      alert('Please select a client.');
       return;
     }
     if (!category.trim()) {
       alert('Please select a category.');
       return;
     }
-    const tasks = loadTasks();
+    const finalTitle = title.trim();
+    if (!finalTitle) {
+      alert('Please select or enter a task title.');
+      return;
+    }
 
-    const base = slugify(name) || 'task';
-    let slug = base;
-    let i = 2;
-    while (tasks.some((t) => t.slug === slug)) slug = `${base}-${i++}`;
+    // Load existing calendar-compatible tasks
+    let list = await getTasksFE();
 
-    const countNum = parseInt(frequencyCountStr, 10);
-    const hasFrequency = Number.isFinite(countNum) && countNum > 0;
-    const frequencyDays = hasFrequency
-      ? toDays(countNum, frequencyUnit)
-      : undefined;
-    const legacyStr = hasFrequency
-      ? `${countNum} ${frequencyUnit}${countNum > 1 ? 's' : ''}`
-      : undefined;
+    // Generate id
+    const nextId = `${Date.now()}`;
 
-    const newTask: Task = {
-      clientName: activeName,
-      label: name,
-      slug,
-      status: status.trim(),
-      category: category.trim(),
-      frequencyCount: hasFrequency ? countNum : undefined,
-      frequencyUnit: hasFrequency ? frequencyUnit : undefined,
-      frequencyDays,
-      dateFrom: dateFrom || undefined,
-      dateTo: dateTo || undefined,
-      frequency: legacyStr,
-      lastDone: dateFrom && dateTo ? `${dateFrom} to ${dateTo}` : '',
-      deleted: false,
+    // Compute frequency string and nextDue
+    const countNum = Number(frequencyCount || '0');
+    const hasFreq = Number.isFinite(countNum) && countNum > 0;
+    const freqStr = hasFreq ? `Every ${countNum} ${frequencyUnit}${countNum > 1 ? 's' : ''}` : '';
+    const lastDone = dateFrom || '';
+    const nextDue =
+      hasFreq && dateFrom
+        ? addDays(dateFrom, countNum * unitToDays[frequencyUnit])
+        : dateFrom || '';
+
+    const newTask: CalendarTask = {
+      id: nextId,
+      clientId: activeId,
+      title: finalTitle,
+      category,
+      frequency: freqStr,
+      lastDone,
+      nextDue,
+      status: 'Pending',
+      comments: [],
+      files: [],
     };
 
-    saveTasks([...(tasks || []), newTask]);
+    await saveTasksFE([...(list || []), newTask]);
     router.push('/calendar_dashboard');
-  };
-
-  const onLogoClick = () => {
-    router.push('/empty_dashboard');
   };
 
   return (
     <DashboardChrome
-      page="care-edit"
+      page="care-add"
       clients={clients}
-      activeClientId={activeId}
-      activeClientName={activeName}
       onClientChange={onClientChange}
       colors={chromeColors}
-      onLogoClick={onLogoClick}
+      onLogoClick={() => router.push('/empty_dashboard')}
     >
       {/* Fill entire area below the topbar */}
       <div className="w-full h-[720px] bg-[#FAEBDC] flex flex-col">
         {/* Section title bar */}
         <div className="bg-[#3A0000] text-white px-6 py-3">
-          <h2 className="text-xl md:text-3xl font-extrabold px-5">
-            Edit Care Item
-          </h2>
-        </div>
-
-        {/* Notice bar */}
-        <div className="bg-[#F9C9B1] text-black px-6 py-4">
-          <h3 className="text-lg px-5">
-            <strong>IMPORTANT:</strong> Deleting the task or editing the
-            frequency and dates will change the schedule of this care item for
-            the rest of the year. Be aware of any budget implications before
-            making this change!!
-          </h3>
+          <h2 className="text-xl md:text-3xl font-extrabold px-5">Add New Care Item</h2>
         </div>
 
         {/* Form content */}
-        <div className="flex-1 p-8 text-xl">
+        <div className="flex-1 p-16 text-xl">
           <div className="space-y-6 max-w-3xl mx-auto">
-            {/* Category (dropdown) */}
             <Field label="Category">
               <select
                 value={category}
                 onChange={(e) => {
                   setCategory(e.target.value);
-                  setLabel(''); // reset task when category changes
+                  setTitle('');
                 }}
                 className="w-full rounded-lg bg-white border border-[#7c5040]/40 px-3 py-2 text-lg outline-none focus:ring-4 focus:ring-[#7c5040]/20 text-black"
               >
                 <option value="">Select a category…</option>
-                {catalog.map((c: { category: string }) => (
-                  <option key={c.category} value={c.category}>
-                    {c.category}
+                {categories.map((c) => (
+                  <option key={c} value={c}>
+                    {c}
                   </option>
                 ))}
               </select>
             </Field>
 
-            {/* Task name (dropdown depends on category) */}
             <Field label="Task Name">
               <select
-                value={label}
-                onChange={(e) => setLabel(e.target.value)}
+                value={title}
+                onChange={(e) => setTitle(e.target.value)}
                 disabled={!category}
                 className="w-full rounded-lg bg-white border border-[#7c5040]/40 px-3 py-2 text-lg outline-none focus:ring-4 focus:ring-[#7c5040]/20 text-black disabled:opacity-60"
               >
-                <option value="">
-                  {category ? 'Select a task…' : 'Choose a category first'}
-                </option>
-                {tasksInCategory.map((t: { slug: string; label: string }) => (
-                  <option key={t.slug} value={t.label}>
-                    {t.label}
+                <option value="">{category ? 'Select a task…' : 'Choose a category first'}</option>
+                {(titlesByCategory.get(category) || []).map((t) => (
+                  <option key={t} value={t}>
+                    {t}
                   </option>
                 ))}
               </select>
             </Field>
 
-            <Field label="Date Range">
-              <div className="flex items-center gap-3">
-                <input
-                  type="date"
-                  value={dateFrom}
-                  onChange={(e) => setDateFrom(e.target.value)}
-                  className="w-40 rounded-lg bg-white border border-[#7c5040]/40 px-3 py-2 text-lg outline-none focus:ring-4 focus:ring-[#7c5040]/20 text-black"
-                />
-                <span className="text-[#1c130f] text-lg">to</span>
-                <input
-                  type="date"
-                  value={dateTo}
-                  onChange={(e) => setDateTo(e.target.value)}
-                  min={dateFrom || undefined}
-                  className="w-40 rounded-lg bg-white border border-[#7c5040]/40 px-3 py-2 text-lg outline-none focus:ring-4 focus:ring-[#7c5040]/20 text-black"
-                />
-              </div>
+            <Field label="Start Date">
+              <input
+                type="date"
+                value={dateFrom}
+                onChange={(e) => setDateFrom(e.target.value)}
+                className="w-40 rounded-lg bg-white border border-[#7c5040]/40 px-3 py-2 text-lg outline-none focus:ring-4 focus:ring-[#7c5040]/20 text-black"
+              />
             </Field>
 
             <Field label="Repeat Every">
@@ -307,12 +234,10 @@ export default function AddTaskPage() {
                   type="text"
                   inputMode="numeric"
                   pattern="[0-9]*"
-                  value={frequencyCountStr}
-                  onChange={(e) =>
-                    setFrequencyCountStr(e.target.value.replace(/[^\d]/g, ''))
-                  }
+                  value={frequencyCount}
+                  onChange={(e) => setFrequencyCount(e.target.value.replace(/[^\d]/g, ''))}
                   className="w-28 rounded-lg bg-white border border-[#7c5040]/40 px-3 py-2 text-lg outline-none focus:ring-4 focus:ring-[#7c5040]/20 text-black"
-                  placeholder="e.g., 90"
+                  placeholder="e.g., 3"
                 />
                 <select
                   value={frequencyUnit}
@@ -327,38 +252,8 @@ export default function AddTaskPage() {
               </div>
             </Field>
 
-            <Field label="Status">
-              <select
-                value={status}
-                onChange={(e) => setStatus(e.target.value)}
-                className="w-full rounded-lg bg-white border border-[#7c5040]/40 px-3 py-2 text-lg outline-none focus:ring-4 focus:ring-[#7c5040]/20 text-black"
-              >
-                {statusOptions.map((opt) => (
-                  <option key={opt} value={opt}>
-                    {opt}
-                  </option>
-                ))}
-              </select>
-            </Field>
-
-            <Field label="Notes">
-              <input
-                value={notes}
-                onChange={(e) => setNotes(e.target.value)}
-                className="w-full rounded-lg bg-white border border-[#7c5040]/40 px-3 py-2 text-lg outline-none focus:ring-4 focus:ring-[#7c5040]/20 text-black"
-                placeholder="e.g., add notes for this care item here"
-              />
-            </Field>
-
             {/* Footer buttons */}
-            <div className="pt-2 flex items-center justify-center gap-30">
-              <button
-                onClick={onDelete}
-                className="rounded-full text-white text-xl font-semibold px-6.5 py-2.5 shadow"
-                style={{ backgroundColor: palette.danger }}
-              >
-                Delete
-              </button>
+            <div className="pt-6 flex items-center justify-center gap-30">
               <button
                 onClick={() => router.push('/calendar_dashboard')}
                 className="px-6 py-2.5 rounded-full border border-[#3A0000] text-gray-700 hover:bg-gray-200"
@@ -367,9 +262,9 @@ export default function AddTaskPage() {
               </button>
               <button
                 onClick={onCreate}
-                className="rounded-full bg-[#F39C6B] hover:bg-[#ef8a50] text-[#1c130f] text-xl font-bold px-7.5 py-2.5 shadow"
+                className="rounded-full bg-[#F39C6B] hover:bg-[#ef8a50] text-[#1c130f] text-xl font-bold px-8 py-2.5 shadow"
               >
-                Save
+                Add
               </button>
             </div>
           </div>
@@ -379,13 +274,7 @@ export default function AddTaskPage() {
   );
 }
 
-function Field({
-  label,
-  children,
-}: {
-  label: string;
-  children: React.ReactNode;
-}) {
+function Field({ label, children }: { label: string; children: React.ReactNode }) {
   return (
     <div className="grid grid-cols-[180px_1fr] items-center gap-4">
       <div className="text-xl font-semibold text-[#1c130f]">{label}</div>

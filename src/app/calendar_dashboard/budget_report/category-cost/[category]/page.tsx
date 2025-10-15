@@ -1,14 +1,11 @@
 /**
  * File path: app/calendar_dashboard/category-cost/[category]/page.tsx
- * Frontend Author: Qingyue Zhao
+ * Frontend Author: Qingyue Zhao (revised)
  *
- * Purpose:
- * - Category Budget Report page for a specific category (e.g., Appointments).
- * - Uses the SAME full-bleed layout & chrome as the annual Budget Report page.
- * - Reached by clicking a category link on the annual report.
- * - Fetches rows via getBudgetRowsFE(activeClientId).
- *
- * TO DO: requires back-end integration
+ * What’s new in this version:
+ * - Also maps {_id -> id} when passing data to DashboardChrome.
+ * - Adds an optional override value for “Category Total Budget”, which is persisted in localStorage (by clientId + year + category).
+ * - All roles can view the override values saved by management.
  */
 
 'use client';
@@ -21,15 +18,15 @@ import DashboardChrome from '@/components/top_menu/client_schedule';
 import Badge from '@/components/ui/Badge';
 
 import {
-  getViewerRole,
-  getClients,
-  getActiveClient,
-  setActiveClient,
+  getViewerRoleFE,
+  getClientsFE,
+  readActiveClientFromStorage,
+  writeActiveClientToStorage,
   type Client as ApiClient,
-} from '@/lib/data';
+} from '@/lib/mock/mockApi';
 import { getBudgetRowsFE, type BudgetRow } from '@/lib/mock/mockApi';
 
-/* ------------------------------- Utils ------------------------------- */
+/* ------------------------------- Helpers ------------------------------- */
 const unslug = (s: string) =>
   s
     .split('-')
@@ -43,22 +40,46 @@ const getStatus = (remaining: number): { tone: Tone; label: string } => {
   return { tone: 'green', label: 'Within Limit' };
 };
 
-/* ------------------------------- Chrome colors ------------------------------- */
 const colors = {
   header: '#3A0000',
   banner: '#F9C9B1',
   text: '#2b2b2b',
 };
 
-/* ---------------------------------- Types ---------------------------------- */
-type Client = { id: string; name: string };
 type Role = 'carer' | 'family' | 'management';
+type ClientLite = { id: string; name: string; orgAccess?: 'approved' | 'pending' | 'revoked' };
+
+/** ---------- Category override persistence ---------- */
+const CAT_OVERRIDE_KEY = 'categoryBudgetOverrideByClientYearCategory';
+// shape: { [clientId]: { [year]: { [categoryName]: number } } }
+function readCatOverrides(): Record<string, Record<string, Record<string, number>>> {
+  try {
+    const raw = localStorage.getItem(CAT_OVERRIDE_KEY);
+    if (raw) return JSON.parse(raw);
+  } catch {}
+  return {};
+}
+function writeCatOverrides(m: Record<string, Record<string, Record<string, number>>>) {
+  try {
+    localStorage.setItem(CAT_OVERRIDE_KEY, JSON.stringify(m));
+  } catch {}
+}
+function getCatOverride(clientId: string, year: string, category: string): number | null {
+  const m = readCatOverrides();
+  const v = m[clientId]?.[year]?.[category];
+  return typeof v === 'number' && Number.isFinite(v) ? v : null;
+}
+function setCatOverride(clientId: string, year: string, category: string, value: number) {
+  const m = readCatOverrides();
+  m[clientId] = m[clientId] || {};
+  m[clientId][year] = m[clientId][year] || {};
+  m[clientId][year][category] = value;
+  writeCatOverrides(m);
+}
 
 export default function CategoryCostPage() {
   return (
-    <Suspense
-      fallback={<div className="p-6 text-gray-600">Loading category...</div>}
-    >
+    <Suspense fallback={<div className="p-6 text-gray-600">Loading category...</div>}>
       <CategoryCostInner />
     </Suspense>
   );
@@ -73,38 +94,47 @@ function CategoryCostInner() {
   /* ===== Role ===== */
   const [role, setRole] = useState<Role>('family');
   useEffect(() => {
-    (async () => {
-      const r = await getViewerRole();
-      setRole(r);
-    })();
+    setRole(getViewerRoleFE());
   }, []);
   const isManagement = role === 'management';
 
   /* ===== Clients ===== */
-  const [clients, setClients] = useState<Client[]>([]);
+  const [clients, setClients] = useState<ClientLite[]>([]);
   const [activeClientId, setActiveClientId] = useState<string | null>(null);
   const [displayName, setDisplayName] = useState<string>('');
 
   /* ===== Budget rows ===== */
   const [rowsAll, setRowsAll] = useState<BudgetRow[]>([]);
 
+  /* ===== Local state ===== */
+  const [q, setQ] = useState('');
+  const [year, setYear] = useState('2025');
+
+  const [isEditing, setIsEditing] = useState(false);
+  const [categoryBudgetOverride, setCategoryBudgetOverride] = useState<number | null>(null);
+  const [categoryBudgetInput, setCategoryBudgetInput] = useState<string>('');
+
   /** Load clients */
   useEffect(() => {
     (async () => {
       try {
-        const list = await getClients();
-        const mapped: Client[] = list.map((c: ApiClient) => ({
+        const list = await getClientsFE();
+        const mapped: ClientLite[] = list.map((c: ApiClient) => ({
           id: c._id,
           name: c.name,
+          orgAccess: c.orgAccess,
         }));
         setClients(mapped);
 
-        const active = await getActiveClient();
-        if (active.id) {
-          setActiveClientId(active.id);
-          setDisplayName(
-            active.name || mapped.find((m) => m.id === active.id)?.name || ''
-          );
+        const { id, name } = readActiveClientFromStorage();
+        if (id) {
+          setActiveClientId(id);
+          setDisplayName(name || mapped.find((m) => m.id === id)?.name || '');
+        } else if (mapped.length) {
+          const first = mapped[0];
+          setActiveClientId(first.id);
+          setDisplayName(first.name);
+          writeActiveClientToStorage(first.id, first.name);
         }
       } catch {
         setClients([]);
@@ -112,10 +142,11 @@ function CategoryCostInner() {
     })();
   }, []);
 
-  /** Load budget rows when active client changes */
+  /** Load budget rows & category override when active client/year/category changes */
   useEffect(() => {
     if (!activeClientId) {
       setRowsAll([]);
+      setCategoryBudgetOverride(null);
       return;
     }
     (async () => {
@@ -125,33 +156,32 @@ function CategoryCostInner() {
       } catch {
         setRowsAll([]);
       }
+      const override = getCatOverride(activeClientId, year, categoryName);
+      setCategoryBudgetOverride(override);
     })();
-  }, [activeClientId]);
+  }, [activeClientId, year, categoryName]);
 
   /** Handle client change in banner */
-  const onClientChange = async (id: string) => {
+  const onClientChange = (id: string) => {
     if (!id) {
       setActiveClientId(null);
       setDisplayName('');
-      await setActiveClient(null);
+      writeActiveClientToStorage('', '');
       return;
     }
     const c = clients.find((x) => x.id === id);
     const name = c?.name || '';
     setActiveClientId(id);
     setDisplayName(name);
-    await setActiveClient(id, name);
+    writeActiveClientToStorage(id, name);
+
+    const override = getCatOverride(id, year, categoryName);
+    setCategoryBudgetOverride(override);
   };
 
-  const onLogoClick = () => {
-    router.push('/icon_dashboard');
-  };
+  const onLogoClick = () => router.push('/icon_dashboard');
 
-  /* ===== Local state ===== */
-  const [q, setQ] = useState('');
-  const [year, setYear] = useState('2025');
-
-  /** Filter rows for this category */
+  /** Rows for this category */
   const rows = useMemo(
     () =>
       rowsAll.filter(
@@ -160,7 +190,7 @@ function CategoryCostInner() {
     [rowsAll, categoryName]
   );
 
-  /** Apply search */
+  /** Search */
   const filtered = useMemo(() => {
     const t = q.trim().toLowerCase();
     if (!t) return rows;
@@ -170,18 +200,12 @@ function CategoryCostInner() {
     );
   }, [q, rows]);
 
-  /** Totals */
+  /** Totals (base from actual rows) */
   const baseTotals = useMemo(() => {
     const allocated = filtered.reduce((s, r) => s + r.allocated, 0);
     const spent = filtered.reduce((s, r) => s + r.spent, 0);
     return { allocated, spent, remaining: allocated - spent };
   }, [filtered]);
-
-  const [isEditing, setIsEditing] = useState(false);
-  const [categoryBudgetOverride, setCategoryBudgetOverride] = useState<
-    number | null
-  >(null);
-  const [categoryBudgetInput, setCategoryBudgetInput] = useState<string>('');
 
   const effectiveAllocated = categoryBudgetOverride ?? baseTotals.allocated;
   const effectiveRemaining = effectiveAllocated - baseTotals.spent;
@@ -191,7 +215,7 @@ function CategoryCostInner() {
   return (
     <DashboardChrome
       page="budget"
-      clients={clients}
+      clients={clients}                // ✅ 已映射
       onClientChange={onClientChange}
       colors={colors}
       onLogoClick={onLogoClick}
@@ -200,15 +224,22 @@ function CategoryCostInner() {
         {/* Top bar */}
         <div className="w-full bg-[#3A0000] px-6 py-4 flex items-center justify-between">
           <div className="flex items-center gap-8">
-            <Link
-              href="/calendar_dashboard/budget_report"
-              className="text-white/90 hover:text-white font-semibold"
-            >
+            <Link href="/calendar_dashboard/budget_report" className="text-white/90 hover:text-white font-semibold">
               &lt; Back
             </Link>
-            <h2 className="text-white text-2xl font-semibold">
-              {categoryName} Budget
-            </h2>
+            <h2 className="text-white text-2xl font-semibold">{categoryName} Budget</h2>
+            <div className="flex items-center gap-2 ml-8">
+              <span className="font-semibold text-white text-lg">Select year:</span>
+              <select
+                value={year}
+                onChange={(e) => setYear(e.target.value)}
+                className="rounded-md bg-white text-sm px-3 py-1 border"
+              >
+                <option value="2025">2025</option>
+                <option value="2024">2024</option>
+                <option value="2023">2023</option>
+              </select>
+            </div>
           </div>
 
           <div className="flex items-center gap-3">
@@ -223,9 +254,7 @@ function CategoryCostInner() {
                 <button
                   onClick={() => {
                     setIsEditing(true);
-                    setCategoryBudgetInput(
-                      String(categoryBudgetOverride ?? baseTotals.allocated)
-                    );
+                    setCategoryBudgetInput(String(categoryBudgetOverride ?? baseTotals.allocated));
                   }}
                   className="px-3 py-1 rounded-md bg-white text-black font-semibold hover:bg-black/10"
                 >
@@ -236,8 +265,9 @@ function CategoryCostInner() {
                   <button
                     onClick={() => {
                       const val = parseFloat(categoryBudgetInput);
-                      if (!Number.isFinite(val) || val < 0) return;
+                      if (!Number.isFinite(val) || val < 0 || !activeClientId) return;
                       setCategoryBudgetOverride(val);
+                      setCatOverride(activeClientId, year, categoryName, val); // ✅ 持久化（跨角色共享）
                       setIsEditing(false);
                     }}
                     className="px-3 py-1 rounded-md bg-white text-black font-semibold hover:bg-black/10"
@@ -263,12 +293,7 @@ function CategoryCostInner() {
           <div className="w-full bg-[#fde7e4] border-y border-[#f5c2c2] px-6 py-3">
             <p className="text-[#9b2c2c] font-semibold">
               WARNING: {firstExceeded.item} budget exceeded by{' '}
-              <b>
-                $
-                {(
-                  firstExceeded.spent - firstExceeded.allocated
-                ).toLocaleString()}
-              </b>
+              <b>${(firstExceeded.spent - firstExceeded.allocated).toLocaleString()}</b>
             </p>
           </div>
         )}
@@ -291,25 +316,19 @@ function CategoryCostInner() {
                 </>
               ) : (
                 <>
-                  <div className="text-2xl font-bold">
-                    ${effectiveAllocated.toLocaleString()}
-                  </div>
+                  <div className="text-2xl font-bold">${effectiveAllocated.toLocaleString()}</div>
                   <div className="text-sm">{categoryName} Budget</div>
                 </>
               )}
             </div>
 
             <div className="rounded-2xl border px-6 py-8 bg-white">
-              <div className="text-2xl font-bold">
-                ${baseTotals.spent.toLocaleString()}
-              </div>
+              <div className="text-2xl font-bold">${baseTotals.spent.toLocaleString()}</div>
               <div className="text-sm">Spent to Date</div>
             </div>
 
             <div className="rounded-2xl border px-6 py-8 bg-white">
-              <div
-                className={`text-2xl font-bold ${effectiveRemaining < 0 ? 'text-red-600' : 'text-green-600'}`}
-              >
+              <div className={`text-2xl font-bold ${effectiveRemaining < 0 ? 'text-red-600' : 'text-green-600'}`}>
                 {effectiveRemaining < 0
                   ? `-$${Math.abs(effectiveRemaining).toLocaleString()}`
                   : `$${effectiveRemaining.toLocaleString()}`}
@@ -334,19 +353,12 @@ function CategoryCostInner() {
                   const remaining = r.allocated - r.spent;
                   const status = getStatus(remaining);
                   return (
-                    <tr
-                      key={i}
-                      className="border-b last:border-b border-[#3A0000]/20"
-                    >
+                    <tr key={i} className="border-b last:border-b border-[#3A0000]/20">
                       <td className="px-4 py-5 font-semibold">{r.item}</td>
                       <td className="px-4 py-5">${r.allocated}</td>
                       <td className="px-4 py-5">${r.spent}</td>
-                      <td
-                        className={`px-4 py-5 ${remaining < 0 ? 'text-red-600' : ''}`}
-                      >
-                        {remaining < 0
-                          ? `-$${Math.abs(remaining)}`
-                          : `$${remaining}`}
+                      <td className={`px-4 py-5 ${remaining < 0 ? 'text-red-600' : ''}`}>
+                        {remaining < 0 ? `-$${Math.abs(remaining)}` : `$${remaining}`}
                       </td>
                       <td className="px-4 py-5">
                         <Badge tone={status.tone}>{status.label}</Badge>
