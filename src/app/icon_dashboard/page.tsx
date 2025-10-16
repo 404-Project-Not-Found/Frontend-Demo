@@ -48,7 +48,7 @@ const BUTTONS: Record<StrictRole, ButtonDef[]> = {
     { label: 'Staff Schedule', icon: Users, href: '/management_dashboard/staff_schedule' },
     { label: 'Budget Report', icon: FileText, href: '/calendar_dashboard/budget_report' },
     { label: 'Transactions', icon: Receipt, href: '/calendar_dashboard/transaction_history' },
-    { label: 'Family Requests', icon: ClipboardList, href: '/request-log-page' },
+    { label: 'Family Requests', icon: ClipboardList, href: '/family_dashboard/request_of_change_page' },
     { label: 'FAQ', icon: HelpCircle, href: '/faq' },
   ],
   carer: [

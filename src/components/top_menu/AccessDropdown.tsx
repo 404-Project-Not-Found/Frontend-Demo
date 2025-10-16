@@ -106,12 +106,12 @@ export default function AccessMenu({ clientId }: { clientId?: string | null }) {
     <div className="relative print:hidden">
       <details className="group">
         <summary className="inline-flex items-center gap-2 list-none cursor-pointer font-extrabold text-xl hover:underline select-none">
-          Access menu <span className="text-black/70">▼</span>
+          User with Access <span className="text-black/70">▼</span>
         </summary>
 
         <div className="absolute left-1/2 -translate-x-1/2 mt-3 w-96 rounded-md border border-black/20 bg-white text-black shadow-2xl z-50">
           {/* Organisation picker (persists across refresh) */}
-          <OrgPicker />
+          {/* <OrgPicker /> */}
 
           {/* Users with access */}
           <div className="px-5 py-3">
