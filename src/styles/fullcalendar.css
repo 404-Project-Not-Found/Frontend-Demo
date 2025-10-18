@@ -1,92 +1,83 @@
-/* ===== FullCalendar ===== */
-.fc-theme-standard .fc-scrollgrid {
-  border: none !important;
-}
-.fc-theme-standard td,
-.fc-theme-standard th {
-  border: none !important;
-  background: transparent !important;
-}
+/* —  strip events — */
+.fc .fc-daygrid-day-events { margin-top: 4px; }
 
-.fc .fc-col-header-cell-cushion {
-  text-transform: uppercase !important;
-  font-weight: 600;
-  color: #3d0000;
-  font-size: 0.9rem;
-}
-
-.fc-toolbar-title {
-  font-size: 1.5rem;
-  font-weight: 700;
-  color: #3d0000;
-}
-.fc .fc-toolbar button {
-  background: none !important;
-  border: none !important;
-  box-shadow: none !important;
-  color: #f6a56f !important;
-  font-size: 1.5rem;
-  padding: 0 8px;
-}
-.fc .fc-toolbar button:hover {
-  background: none !important;
-  color: #d96f3d !important;
-}
-
-/* ===== General style for date numbers (placed before highlights) ===== */
-.fc-daygrid-day-number {
-  color: #000 !important;
+/* Base strip (block-level event) */
+.fc .fc-h-event.task-grid {
+  background: #e88092;           
+  border: 0;
+  border-radius: 6px;
+  height: 18px;
+  line-height: 18px;
+  padding: 0 6px;
+  color: #fff;
+  font-size: 12px;
   font-weight: 500;
-  line-height: 0.9;
-  font-size: 18px;
-  /* To move it further toward bottom-left, adjust margin here (e.g., top 20px, left 12px) */
-  margin: 16px 30 -2 0;
-  padding: 0; /* Do not affect highlight area — highlight styles will override */
-  text-align: left;
-  display: block; /* Will be overridden as inline-block in highlight styles */
+  box-shadow: 0 0 0 1px rgba(0,0,0,0.06) inset;
 }
 
-/* Space between the first row and weekday headers */
-.fc-daygrid-day-top {
-  padding-top: 12px;
+/* Event title text (truncate overflow) */
+.fc .fc-h-event.task-grid .fc-event-title,
+.task-grid-title {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-/* ===== Highlights (placed last, with !important to prevent override) ===== */
+/* Remove the default event dot */
+.fc .fc-daygrid-event-dot { display: none; }
 
-/* Today: red circle */
-.fc-daygrid-day.fc-today-custom .fc-daygrid-day-number {
-  position: relative; /* Anchor point for pseudo-element */
-  z-index: 1; /* Ensure the text is above the circle */
+/* Subtle highlight for today’s cell — adjust to your palette */
+.fc .fc-daygrid-day.fc-day-today .fc-daygrid-day-frame,
+.fc-today-custom .fc-daygrid-day-frame {
+  background: rgba(106, 90, 205, 0.06);
 }
 
-.fc-daygrid-day.fc-today-custom .fc-daygrid-day-number::before {
-  content: '';
-  position: absolute;
-  top: 50%;
-  left: 50%;
-  width: 28px;
-  height: 28px;
-  background-color: #ff9999;
-  border-radius: 50%;
-  transform: translate(-50%, -50%);
-  z-index: -1; /* Circle sits below the text */
+/* “+X more” link style tweaks */
+.fc .fc-more-link {
+  font-size: 12px;
+  color: #3A0000;
 }
 
-/* Days with tasks: light blue rectangle */
-.fc-daygrid-day.fc-task-day .fc-daygrid-day-number {
-  position: relative;
-  z-index: 1;
+/* add a soft background to days that have tasks */
+.fc-task-day .fc-daygrid-day-frame {
+  background: rgba(199, 109, 49, 0.06);
 }
 
-.fc-daygrid-day.fc-task-day .fc-daygrid-day-number::before {
-  content: '';
-  position: absolute;
-  top: 50%;
-  left: 50%;
-  width: 28px;
-  height: 28px;
-  background-color: #cce5ff;
-  border-radius: 0.25rem;
-  transform: translate(-50%, -50%);
-  z-index: -1;
+/* Prev / Next buttons */
+.fc .fc-prev-button,
+.fc .fc-next-button {
+  background-color: #3A0000;
+  border-color: #3A0000;
+  color: #fff; 
+}
+
+/* Hover */
+.fc .fc-prev-button:hover,
+.fc .fc-next-button:hover {
+  background-color: #5f0000;
+  border-color: #5f0000;
+}
+
+/* Active  */
+.fc .fc-prev-button:active,
+.fc .fc-next-button:active,
+.fc .fc-prev-button.fc-button-active,
+.fc .fc-next-button.fc-button-active {
+  background-color: #520000;
+  border-color: #520000;
+}
+
+/* Disabled */
+.fc .fc-prev-button:disabled,
+.fc .fc-next-button:disabled {
+  background-color: #bfa9a9;
+  border-color: #bfa9a9;
+  opacity: .7;
+}
+
+/* border */
+.fc .fc-prev-button,
+.fc .fc-next-button {
+  border-radius: 12px;
 }
